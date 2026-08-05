@@ -254,6 +254,8 @@ export interface DataStore {
   createPlantTag(form: { plantCode: string; plantName: string; srlNo: string; size: string; location: string; warehouse: string }): Promise<PlantTag>;
   replaceOnhandItems(rows: Array<Omit<OnhandItem, 'id'>>): Promise<OnhandItem[]>;
   createOnhandItem(form: Omit<OnhandItem, 'id'>): Promise<OnhandItem>;
+  deleteOnhandItem(id: string): Promise<void>;
+  deleteOnhandItems(ids: string[]): Promise<void>;
   createUserAccount(form: { username: string; password: string; role: 'admin' | 'garden' }): Promise<UserAccount>;
   resetPassword(id: string, newPassword: string): Promise<UserAccount>;
   deleteUserAccount(id: string): Promise<void>;
@@ -852,6 +854,17 @@ export class LocalStore implements DataStore {
     return item;
   }
 
+  async deleteOnhandItem(id: string): Promise<void> {
+    const data = this.read();
+    this.write({ ...data, onhandItems: data.onhandItems.filter(i => i.id !== id) });
+  }
+
+  async deleteOnhandItems(ids: string[]): Promise<void> {
+    const data = this.read();
+    const idSet = new Set(ids);
+    this.write({ ...data, onhandItems: data.onhandItems.filter(i => !idSet.has(i.id)) });
+  }
+
   async createUserAccount(form: { username: string; password: string; role: 'admin' | 'garden' }): Promise<UserAccount> {
     const data = this.read();
     const uname = form.username.trim();
@@ -1114,6 +1127,14 @@ export class ApiStore implements DataStore {
   }
 
   async createOnhandItem(): Promise<OnhandItem> {
+    throw new Error('Onhand is not yet available when connected to the shared database');
+  }
+
+  async deleteOnhandItem(): Promise<void> {
+    throw new Error('Onhand is not yet available when connected to the shared database');
+  }
+
+  async deleteOnhandItems(): Promise<void> {
     throw new Error('Onhand is not yet available when connected to the shared database');
   }
 

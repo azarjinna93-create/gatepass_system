@@ -536,10 +536,11 @@ function emptyUserForm(): UserForm {
 interface ReportRow {
   key: string; slNo: number;
   date: string; gpNo: string; dnNo: string; category: string; itemDescription: string;
+  plantCode: string; plantName: string; spec: string;
   party: string; customerProject: string; project: string;
   lpoNo: string; prRef: string; soRef: string; doNo: string;
   deliveryQty: number; postedQty: string; remainingQty: string; location: string; remarks: string;
-  status: LineStatus;
+  status: LineStatus; serials: string[];
 }
 
 type LineStatus = 'Closed' | 'Open' | 'Pending';
@@ -961,6 +962,7 @@ export default function GatePassApp() {
   const [plantTags, setPlantTags] = useState<PlantTag[]>([]);
   const [onhandItems, setOnhandItems] = useState<OnhandItem[]>([]);
   const [onhandSearch, setOnhandSearch] = useState('');
+  const [onhandSelected, setOnhandSelected] = useState<Set<string>>(new Set());
 
   // ── Navigation targets ──
   const [activeGpNo, setActiveGpNo] = useState<string | null>(null);
@@ -1065,6 +1067,23 @@ export default function GatePassApp() {
       }
     })();
   }, []);
+
+  // Keep data in sync with other users on the shared database — poll in the
+  // background, plus an immediate refresh whenever the tab regains focus so
+  // switching back to it doesn't leave stale data waiting on the next tick.
+  useEffect(() => {
+    if (!auth) return;
+    const interval = setInterval(() => { void reload(); }, 15000);
+    const onFocus = () => { void reload(); };
+    const onVisibility = () => { if (document.visibilityState === 'visible') onFocus(); };
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      clearInterval(interval);
+      window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+  }, [auth]);
 
   const activeGp = gps.find(g => g.no === activeGpNo) || null;
   const activeDn = dns.find(d => d.no === activeDnNo) || null;
@@ -1541,6 +1560,42 @@ export default function GatePassApp() {
     } catch (e) { setToast((e as Error).message); }
   };
 
+  const deleteOnhandItem = async (it: OnhandItem) => {
+    if (!window.confirm(`Delete onhand item "${it.itemNumber || it.itemName}"? This cannot be undone.`)) return;
+    try {
+      await getStore().deleteOnhandItem(it.id);
+      await reload();
+      setToast('Onhand item deleted');
+    } catch (e) { setToast((e as Error).message); }
+  };
+
+  const toggleOnhandSelected = (id: string) => {
+    setOnhandSelected(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  };
+
+  const toggleOnhandSelectAll = (ids: string[]) => {
+    setOnhandSelected(prev => {
+      const allSelected = ids.length > 0 && ids.every(id => prev.has(id));
+      return allSelected ? new Set() : new Set(ids);
+    });
+  };
+
+  const deleteSelectedOnhandItems = async () => {
+    const count = onhandSelected.size;
+    if (count === 0) return;
+    if (!window.confirm(`Delete ${count} selected onhand item${count === 1 ? '' : 's'}? This cannot be undone.`)) return;
+    try {
+      await getStore().deleteOnhandItems(Array.from(onhandSelected));
+      setOnhandSelected(new Set());
+      await reload();
+      setToast(`${count} onhand item${count === 1 ? '' : 's'} deleted`);
+    } catch (e) { setToast((e as Error).message); }
+  };
+
   // ── User Account form handlers ──
   const openNewUser = () => {
     setUserForm(emptyUserForm());
@@ -1707,6 +1762,9 @@ export default function GatePassApp() {
         dnNo: dn.no,
         category: plant?.category || '',
         itemDescription: line.spec ? `${line.plantName} · ${line.spec}` : line.plantName,
+        plantCode: line.plantCode,
+        plantName: line.plantName,
+        spec: line.spec,
         party: gp?.party || '',
         customerProject: dn.customerProject,
         project: gp?.project || '',
@@ -1720,6 +1778,7 @@ export default function GatePassApp() {
         location: line.location,
         remarks: line.remarks,
         status: lineStatus(line.postedQty, line.deliveryQty),
+        serials: line.serials,
       };
     });
   });
@@ -1770,6 +1829,34 @@ export default function GatePassApp() {
     XLSX.utils.book_append_sheet(wb, ws, 'Report');
     const filterActive = !!(reportFilterGpNo || reportFilterDnNo || reportFilterCustomerProject || reportFilterProject || reportFilterFromDate || reportFilterToDate || reportFilterStatus);
     XLSX.writeFile(wb, `Report-${filterActive ? 'Filtered' : 'Full'}-${today()}.xlsx`);
+  };
+
+  // One row per physically scanned barcode (not per line), across every
+  // Delivery Note in the system — no filters, joined back to its DO Number /
+  // Customer & Project / item. Triggered from a single one-click Settings action.
+  const exportAllScanDataToExcel = () => {
+    const rows: Record<string, unknown>[] = [];
+    reportRows.forEach(r => {
+      r.serials.forEach(serial => {
+        rows.push({
+          'DO Number': r.doNo,
+          'Customer & Project': r.customerProject,
+          'Project': r.project,
+          'Plant Code': r.plantCode,
+          'Plant Name': r.plantName,
+          'Specification': r.spec,
+          'Scanned Serial No.': serial,
+          'Delivery Note No.': r.dnNo,
+          'Gate Pass No.': r.gpNo,
+          'Date': r.date,
+          'Location': r.location,
+        });
+      });
+    });
+    const ws = XLSX.utils.json_to_sheet(rows);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'Scan Data');
+    XLSX.writeFile(wb, `DO-Scanner-Data-${today()}.xlsx`);
   };
 
   // ── Sidebar nav items ─────────────────────────────────────────────────────
@@ -1860,9 +1947,6 @@ export default function GatePassApp() {
           style={{ width: '100%', marginTop: 10, padding: 10, background: 'transparent', color: '#5b6660', border: 'none', fontSize: 13.5, fontWeight: 600, cursor: 'pointer', fontFamily: 'inherit' }}>
           ← Choose a different role
         </button>
-        <div style={{ marginTop: 14, textAlign: 'center', fontSize: 11.5, color: '#9aa39d' }}>
-          Demo: admin / admin123 &nbsp;·&nbsp; garden / garden123
-        </div>
       </div>
       <Toast msg={toast} />
     </div>
@@ -2398,6 +2482,11 @@ export default function GatePassApp() {
                   label="LPO / SO Mapping"
                   description={`${lpoSoMappings.length} mapping${lpoSoMappings.length === 1 ? '' : 's'} on file`}
                   onClick={() => setView('admin_lposo')}
+                />
+                <SettingsCard
+                  label="DO Scanner Data"
+                  description="One-click Excel export of every scanned barcode, all Delivery Notes"
+                  onClick={exportAllScanDataToExcel}
                 />
               </div>
             </div>
@@ -3037,25 +3126,41 @@ export default function GatePassApp() {
               <p style={{ marginTop: '-12px', marginBottom: 16, fontSize: 12.5, color: '#9aa39d' }}>
                 Excel file must have &quot;Item Number&quot; and/or &quot;Item Name&quot; columns (Style, Search Name, Size, Color, Site, Warehouse, Location, Physical Inventory, Unit Rate are optional).
               </p>
-              <div style={{ maxWidth: 360, marginBottom: 16 }}>
-                <Inp value={onhandSearch} onChange={setOnhandSearch} placeholder="Search item number, name, style..." />
+              <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 16 }}>
+                <div style={{ maxWidth: 360, flex: 1 }}>
+                  <Inp value={onhandSearch} onChange={setOnhandSearch} placeholder="Search item number, name, style..." />
+                </div>
+                {onhandSelected.size > 0 && (
+                  <Btn onClick={deleteSelectedOnhandItems} style={{ background: '#fdecea', border: '1px solid #f0c4bd', color: '#c0532e', borderRadius: 9, padding: '11px 18px', fontSize: 13.5, fontWeight: 700, cursor: 'pointer' }}>
+                    Delete Selected ({onhandSelected.size})
+                  </Btn>
+                )}
               </div>
+              {(() => {
+                const filteredOnhandItems = onhandItems.filter(it => {
+                  const q = onhandSearch.trim().toLowerCase();
+                  if (!q) return true;
+                  return [it.itemNumber, it.itemName, it.searchName, it.style].some(v => v.toLowerCase().includes(q));
+                });
+                const filteredIds = filteredOnhandItems.map(it => it.id);
+                const allSelected = filteredIds.length > 0 && filteredIds.every(id => onhandSelected.has(id));
+                return (
               <div style={{ background: C.white, border: `1px solid ${C.border}`, borderRadius: 12, overflow: 'hidden', overflowX: 'auto' }}>
                 <table style={{ width: '100%', borderCollapse: 'collapse' }}>
                   <thead>
                     <tr style={{ background: '#f6f8f6' }}>
-                      {['Style', 'Item Number', 'Item Name', 'Search Name', 'Size', 'Color', 'Site', 'Warehouse', 'Location', 'Physical Inventory', 'Unit Rate'].map(h => <Th key={h}>{h}</Th>)}
+                      <Th>
+                        <input type="checkbox" checked={allSelected} onChange={() => toggleOnhandSelectAll(filteredIds)} style={{ cursor: 'pointer' }} />
+                      </Th>
+                      {['Style', 'Item Number', 'Item Name', 'Search Name', 'Size', 'Color', 'Site', 'Warehouse', 'Location', 'Physical Inventory', 'Unit Rate', ''].map(h => <Th key={h}>{h}</Th>)}
                     </tr>
                   </thead>
                   <tbody>
-                    {onhandItems
-                      .filter(it => {
-                        const q = onhandSearch.trim().toLowerCase();
-                        if (!q) return true;
-                        return [it.itemNumber, it.itemName, it.searchName, it.style].some(v => v.toLowerCase().includes(q));
-                      })
-                      .map(it => (
+                    {filteredOnhandItems.map(it => (
                         <tr key={it.id} style={{ borderTop: `1px solid #eef1ee` }}>
+                          <td style={{ padding: '13px 16px' }}>
+                            <input type="checkbox" checked={onhandSelected.has(it.id)} onChange={() => toggleOnhandSelected(it.id)} style={{ cursor: 'pointer' }} />
+                          </td>
                           <td style={{ padding: '13px 16px', fontSize: 13.5, whiteSpace: 'nowrap' }}>{it.style || '—'}</td>
                           <td style={{ padding: '13px 16px', fontWeight: 700, fontSize: 14, whiteSpace: 'nowrap' }}>{it.itemNumber || '—'}</td>
                           <td style={{ padding: '13px 16px', fontSize: 13.5, color: '#46514a' }}>{it.itemName || '—'}</td>
@@ -3067,12 +3172,19 @@ export default function GatePassApp() {
                           <td style={{ padding: '13px 16px', fontSize: 13.5, whiteSpace: 'nowrap' }}>{it.location || '—'}</td>
                           <td style={{ padding: '13px 16px', fontSize: 13.5, textAlign: 'right' }}>{it.physicalInventory.toFixed(2)}</td>
                           <td style={{ padding: '13px 16px', fontSize: 13.5, textAlign: 'right' }}>{it.unitRate.toFixed(2)}</td>
+                          <td style={{ padding: '13px 16px', textAlign: 'right' }}>
+                            <button onClick={() => deleteOnhandItem(it)} style={{ background: 'none', border: 'none', color: '#c0532e', fontWeight: 600, fontSize: 13, cursor: 'pointer', fontFamily: 'inherit' }}>
+                              Delete
+                            </button>
+                          </td>
                         </tr>
                       ))}
                   </tbody>
                 </table>
-                {onhandItems.length === 0 && <Empty text="No onhand data yet." />}
+                {filteredOnhandItems.length === 0 && <Empty text="No onhand data yet." />}
               </div>
+                );
+              })()}
             </div>
           )}
 
