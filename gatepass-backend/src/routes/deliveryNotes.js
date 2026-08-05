@@ -26,6 +26,22 @@ function specOf(l) {
   return a.join(', ');
 }
 
+async function loadAttachments(client, dnId) {
+  const { rows } = await client.query(
+    'SELECT * FROM delivery_note_attachments WHERE dn_id = $1 ORDER BY id',
+    [dnId]
+  );
+  return rows.map((a) => ({
+    id: String(a.id),
+    name: a.name || '',
+    type: a.mime_type || '',
+    size: Number(a.size_bytes) || 0,
+    dataUrl: a.data_url || '',
+    uploadedBy: a.uploaded_by || '',
+    uploadedAt: formatDate(a.uploaded_at) || '',
+  }));
+}
+
 async function loadDeliveryNote(client, dnId) {
   const dn = (await client.query('SELECT * FROM delivery_notes WHERE id = $1', [dnId])).rows[0];
   if (!dn) return null;
@@ -56,6 +72,13 @@ async function loadDeliveryNote(client, dnId) {
       serials,
     });
   }
+  let attachments = [];
+  try {
+    attachments = await loadAttachments(client, dnId);
+  } catch (err) {
+    // Table may not exist until migration is applied
+    if (err.code !== '42P01') throw err;
+  }
   return {
     no: dn.no,
     gpNo: dn.gp_no || '',
@@ -71,6 +94,7 @@ async function loadDeliveryNote(client, dnId) {
     status: dn.status,
     createdAt: formatDate(dn.created_at) || '',
     lines: out,
+    attachments,
   };
 }
 
@@ -429,6 +453,72 @@ router.post('/:no/complete', requireRole('admin', 'garden'), async (req, res, ne
         `UPDATE delivery_notes SET status = 'completed', modified_by = $1, modified_at = now() WHERE id = $2`,
         [actor(req), dn.id]
       );
+      return loadDeliveryNote(c, dn.id);
+    });
+    res.json(result);
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
+    next(err);
+  }
+});
+
+const MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024; // 8 MB
+
+// POST /api/delivery-notes/:no/attachments
+router.post('/:no/attachments', requireRole('admin', 'garden'), async (req, res, next) => {
+  try {
+    const b = req.body || {};
+    const name = b.name != null ? String(b.name).trim() : '';
+    const dataUrl = b.dataUrl != null ? String(b.dataUrl) : '';
+    const size = Number(b.size) || 0;
+    if (!name) return res.status(400).json({ error: 'Attachment name is required' });
+    if (!dataUrl.startsWith('data:')) {
+      return res.status(400).json({ error: 'Attachment dataUrl is required' });
+    }
+    if (size > MAX_ATTACHMENT_BYTES || dataUrl.length > MAX_ATTACHMENT_BYTES * 1.4) {
+      return res.status(400).json({ error: 'Attachment is too large (max 8 MB)' });
+    }
+
+    const result = await withTransaction(async (c) => {
+      const dn = (await c.query('SELECT * FROM delivery_notes WHERE no = $1', [req.params.no])).rows[0];
+      if (!dn) throw Object.assign(new Error('Delivery note not found'), { status: 404 });
+      await c.query(
+        `INSERT INTO delivery_note_attachments
+           (dn_id, name, mime_type, size_bytes, data_url, uploaded_by)
+         VALUES ($1,$2,$3,$4,$5,$6)`,
+        [
+          dn.id,
+          name,
+          b.type != null ? String(b.type) : '',
+          size,
+          dataUrl,
+          actor(req),
+        ]
+      );
+      await touchDn(c, dn.id, actor(req));
+      return loadDeliveryNote(c, dn.id);
+    });
+    res.status(201).json(result);
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
+    next(err);
+  }
+});
+
+// DELETE /api/delivery-notes/:no/attachments/:attachmentId
+router.delete('/:no/attachments/:attachmentId', requireRole('admin', 'garden'), async (req, res, next) => {
+  try {
+    const result = await withTransaction(async (c) => {
+      const dn = (await c.query('SELECT * FROM delivery_notes WHERE no = $1', [req.params.no])).rows[0];
+      if (!dn) throw Object.assign(new Error('Delivery note not found'), { status: 404 });
+      const del = await c.query(
+        `DELETE FROM delivery_note_attachments
+          WHERE dn_id = $1 AND id = $2
+          RETURNING id`,
+        [dn.id, Number(req.params.attachmentId)]
+      );
+      if (!del.rows[0]) throw Object.assign(new Error('Attachment not found'), { status: 404 });
+      await touchDn(c, dn.id, actor(req));
       return loadDeliveryNote(c, dn.id);
     });
     res.json(result);

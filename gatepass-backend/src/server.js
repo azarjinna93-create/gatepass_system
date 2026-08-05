@@ -7,6 +7,7 @@ import authRoutes from './routes/auth.js';
 import deliveryNoteRoutes from './routes/deliveryNotes.js';
 import gatePassRoutes from './routes/gatePasses.js';
 import mastersRoutes from './routes/masters.js';
+import plantTagsRoutes from './routes/plantTags.js';
 import usersRoutes from './routes/users.js';
 
 dotenv.config();
@@ -15,7 +16,8 @@ const app = express();
 
 const origins = (process.env.CORS_ORIGIN || '*').split(',').map(s => s.trim());
 app.use(cors({ origin: origins.includes('*') ? true : origins }));
-app.use(express.json({ limit: '1mb' }));
+// Attachments are stored as data URLs — allow larger JSON bodies.
+app.use(express.json({ limit: '12mb' }));
 
 app.get('/api/health', async (req, res) => {
   try {
@@ -30,6 +32,7 @@ app.use('/api/auth', authRoutes);
 app.use('/api/gate-passes', gatePassRoutes);
 app.use('/api/delivery-notes', deliveryNoteRoutes);
 app.use('/api/masters', mastersRoutes);
+app.use('/api/plant-tags', plantTagsRoutes);
 app.use('/api/users', usersRoutes);
 
 app.use((req, res) => res.status(404).json({ error: 'Not found' }));

@@ -151,6 +151,31 @@ CREATE TABLE serials (
   UNIQUE (dn_line_id, code)
 );
 
+CREATE TABLE plant_tags (
+  id          SERIAL PRIMARY KEY,
+  plant_code  TEXT NOT NULL DEFAULT '',
+  plant_name  TEXT NOT NULL DEFAULT '',
+  srl_no      TEXT NOT NULL,
+  size        TEXT NOT NULL DEFAULT '',
+  location    TEXT NOT NULL DEFAULT '',
+  warehouse   TEXT NOT NULL DEFAULT '',
+  created_by  TEXT,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE UNIQUE INDEX idx_plant_tags_srl_lower ON plant_tags (lower(srl_no));
+
+CREATE TABLE delivery_note_attachments (
+  id          SERIAL PRIMARY KEY,
+  dn_id       INTEGER NOT NULL REFERENCES delivery_notes(id) ON DELETE CASCADE,
+  name        TEXT NOT NULL,
+  mime_type   TEXT NOT NULL DEFAULT '',
+  size_bytes  INTEGER NOT NULL DEFAULT 0,
+  data_url    TEXT NOT NULL,
+  uploaded_by TEXT,
+  uploaded_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 ALTER TABLE gate_passes
   ADD CONSTRAINT fk_gp_delivery_note
   FOREIGN KEY (delivery_note_id) REFERENCES delivery_notes(id) ON DELETE SET NULL;
@@ -160,5 +185,6 @@ CREATE INDEX idx_dn_lines_dn  ON delivery_note_lines (dn_id);
 CREATE INDEX idx_serials_line ON serials (dn_line_id);
 CREATE INDEX idx_dn_gp        ON delivery_notes (gp_id);
 CREATE INDEX idx_gp_dn        ON gate_passes (delivery_note_id);
+CREATE INDEX idx_dn_attachments_dn ON delivery_note_attachments (dn_id);
 
 COMMIT;

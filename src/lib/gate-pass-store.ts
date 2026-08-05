@@ -980,7 +980,7 @@ export class ApiStore implements DataStore {
   }
 
   async loadAll(): Promise<AppData> {
-    const [gps, dns, customers, plants, locations, users, numberSettings] = await Promise.all([
+    const [gps, dns, customers, plants, locations, users, numberSettings, plantTags] = await Promise.all([
       this.request<GatePass[]>('/api/gate-passes'),
       this.request<DeliveryNote[]>('/api/delivery-notes'),
       this.request<Customer[]>('/api/masters/customers'),
@@ -988,9 +988,19 @@ export class ApiStore implements DataStore {
       this.request<LocationMaster[]>('/api/masters/locations'),
       this.request<UserAccount[]>('/api/users'),
       this.request<NumberSettings>('/api/masters/number-settings'),
+      this.request<PlantTag[]>('/api/plant-tags'),
     ]);
     return {
-      gps, customers, plants, locations, users, numberSettings, lpoSoMappings: [], reprintLogs: [], plantTags: [], onhandItems: [],
+      gps,
+      customers,
+      plants,
+      locations,
+      users,
+      numberSettings,
+      lpoSoMappings: [],
+      reprintLogs: [],
+      plantTags: plantTags || [],
+      onhandItems: [],
       dns: dns.map(dn => ({ ...dn, attachments: dn.attachments || [] })),
     };
   }
@@ -1079,12 +1089,21 @@ export class ApiStore implements DataStore {
     return this.request(`/api/delivery-notes/${encodeURIComponent(dnNo)}/complete`, { method: 'POST' });
   }
 
-  async addDeliveryNoteAttachment(): Promise<DeliveryNote> {
-    throw new Error('Attachments are not yet available when connected to the shared database');
+  async addDeliveryNoteAttachment(
+    dnNo: string,
+    file: { name: string; type: string; size: number; dataUrl: string },
+  ): Promise<DeliveryNote> {
+    return this.request(`/api/delivery-notes/${encodeURIComponent(dnNo)}/attachments`, {
+      method: 'POST',
+      body: JSON.stringify(file),
+    });
   }
 
-  async removeDeliveryNoteAttachment(): Promise<DeliveryNote> {
-    throw new Error('Attachments are not yet available when connected to the shared database');
+  async removeDeliveryNoteAttachment(dnNo: string, attachmentId: string): Promise<DeliveryNote> {
+    return this.request(
+      `/api/delivery-notes/${encodeURIComponent(dnNo)}/attachments/${encodeURIComponent(attachmentId)}`,
+      { method: 'DELETE' },
+    );
   }
 
   async createCustomer(form: { customerName: string; party: 'EXT' | 'INT'; projects: string[] }): Promise<Customer> {
@@ -1118,8 +1137,18 @@ export class ApiStore implements DataStore {
     throw new Error('Reprint log is not yet available when connected to the shared database');
   }
 
-  async createPlantTag(): Promise<PlantTag> {
-    throw new Error('Tag Print is not yet available when connected to the shared database');
+  async createPlantTag(form: {
+    plantCode: string;
+    plantName: string;
+    srlNo: string;
+    size: string;
+    location: string;
+    warehouse: string;
+  }): Promise<PlantTag> {
+    return this.request('/api/plant-tags', {
+      method: 'POST',
+      body: JSON.stringify(form),
+    });
   }
 
   async replaceOnhandItems(): Promise<OnhandItem[]> {
