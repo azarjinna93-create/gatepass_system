@@ -39,6 +39,9 @@ services:
         NEXT_PUBLIC_APP_URL: ${NEXT_PUBLIC_APP_URL}
     restart: unless-stopped
     environment:
+      DATABASE_URL: ${DATABASE_URL}
+      PGSSL: ${PGSSL:-true}
+      AUTH_SECRET: ${JWT_SECRET}
       NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL}
       NEXT_PUBLIC_APP_URL: ${NEXT_PUBLIC_APP_URL}
       PORT: "3000"
