@@ -6,6 +6,8 @@
 
 BEGIN;
 
+DROP TABLE IF EXISTS delivery_note_attachments CASCADE;
+DROP TABLE IF EXISTS plant_tags             CASCADE;
 DROP TABLE IF EXISTS serials             CASCADE;
 DROP TABLE IF EXISTS delivery_note_lines CASCADE;
 DROP TABLE IF EXISTS delivery_notes      CASCADE;

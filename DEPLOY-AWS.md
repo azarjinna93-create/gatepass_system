@@ -212,8 +212,7 @@ nano .env.aws
 Edit so it looks like this (use your real values):
 
 ```env
-DATABASE_URL=postgresql://....your-neon-url....
-PGSSL=true
+POSTGRES_PASSWORD=pick-a-strong-password
 JWT_SECRET=pick-a-long-random-secret-here
 NEXT_PUBLIC_APP_URL=http://YOUR_IP
 NEXT_PUBLIC_API_URL=http://YOUR_IP:4000
@@ -232,9 +231,11 @@ How to save in `nano`:
 |------------|----------------|
 | Manager AWS username/password | Browser login only — nowhere in files |
 | `gatepass-key.pem` | Your PC Downloads — used only for SSH |
-| Neon `DATABASE_URL` | Server file `~/gatepass_system/.env.aws` |
-| `JWT_SECRET` | Same `.env.aws` file |
+| `POSTGRES_PASSWORD` / `JWT_SECRET` | Server file `~/gatepass_system/.env.aws` |
 | Public IP URLs | Same `.env.aws` file |
+
+> Database runs as a Docker Postgres container on the same EC2 (volume `gatepass_pgdata`).
+> Neon is optional and not required for AWS deploy.
 
 ---
 
@@ -247,6 +248,13 @@ docker compose -f docker-compose.aws.yml --env-file .env.aws up -d --build
 ```
 
 First build can take **5–15 minutes**. Wait until it finishes.
+
+**First time only** (create empty DB + admin login):
+
+```bash
+docker compose -f docker-compose.aws.yml --env-file .env.aws exec api node scripts/setup.js
+docker compose -f docker-compose.aws.yml --env-file .env.aws exec api node scripts/seed-users-only.js
+```
 
 Check status:
 
