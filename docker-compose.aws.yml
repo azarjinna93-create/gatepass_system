@@ -24,15 +24,14 @@ services:
       timeout: 5s
       retries: 10
       start_period: 10s
-    # Not published to the internet — only reachable by api/web on Docker network
 
   api:
     build:
       context: ./gatepass-backend
     restart: unless-stopped
     environment:
-      DATABASE_URL: postgresql://gatepass:${POSTGRES_PASSWORD}@db:5432/gatepass
-      PGSSL: "false"
+      DATABASE_URL: ${DATABASE_URL}
+      PGSSL: ${PGSSL:-false}
       JWT_SECRET: ${JWT_SECRET}
       CORS_ORIGIN: ${CORS_ORIGIN}
       PORT: "4000"
@@ -62,8 +61,8 @@ services:
         NEXT_PUBLIC_APP_URL: ${NEXT_PUBLIC_APP_URL}
     restart: unless-stopped
     environment:
-      DATABASE_URL: postgresql://gatepass:${POSTGRES_PASSWORD}@db:5432/gatepass
-      PGSSL: "false"
+      DATABASE_URL: ${DATABASE_URL}
+      PGSSL: ${PGSSL:-false}
       AUTH_SECRET: ${JWT_SECRET}
       NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL}
       NEXT_PUBLIC_APP_URL: ${NEXT_PUBLIC_APP_URL}
