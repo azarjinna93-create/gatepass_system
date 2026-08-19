@@ -289,6 +289,51 @@ If you change the public IP or domain, update `.env.aws` and rebuild (especially
 
 ---
 
+## Part K — Weekly database backups (do this once)
+
+The database itself (Neon) lives outside the containers, so backups run as a
+cron job on the EC2 host — it already has the `DATABASE_URL` in `.env.aws`
+and needs no extra secrets.
+
+1. Install the Postgres client tools (provides `pg_dump`):
+
+```bash
+sudo dnf install -y postgresql15
+```
+
+2. Test the backup script once by hand:
+
+```bash
+cd ~/gatepass_system
+bash gatepass-backend/scripts/backup-db.sh
+ls -la backups/
+```
+
+You should see a file like `backups/gatepass-2026-08-18.sql.gz`.
+
+3. Schedule it weekly (Sunday 03:00 UTC) with cron:
+
+```bash
+crontab -e
+```
+
+Add this line, save, and exit:
+
+```
+0 3 * * 0 /usr/bin/bash /home/ec2-user/gatepass_system/gatepass-backend/scripts/backup-db.sh >> /home/ec2-user/gatepass_system/backups/backup.log 2>&1
+```
+
+Backups land in `~/gatepass_system/backups/`, one gzip file per week, with
+anything older than 60 days automatically pruned so disk usage stays bounded.
+
+**To restore** a backup (e.g. onto a fresh Neon database):
+
+```bash
+gunzip -c backups/gatepass-2026-08-18.sql.gz | psql "$DATABASE_URL"
+```
+
+---
+
 ## Common problems
 
 | Problem | What to do |

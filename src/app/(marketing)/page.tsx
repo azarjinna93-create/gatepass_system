@@ -5,7 +5,7 @@ import { createPortal } from 'react-dom';
 import * as XLSX from 'xlsx';
 import QRCode from 'qrcode';
 import { createStore, today, specOf } from '@/lib/gate-pass-store';
-import type { DeliveryNote, DNLine, GatePass, Customer, PlantMaster, LocationMaster, UserAccount, NumberSettings, LpoSoMapping, DataStore, DNAttachment, ReprintLog, PlantTag, OnhandItem } from '@/lib/gate-pass-store';
+import type { DeliveryNote, DNLine, GatePass, Customer, PlantMaster, LocationMaster, UserAccount, NumberSettings, LpoSoMapping, DataStore, DNAttachment, ReprintLog, PlantTag, OnhandItem, GPNotification } from '@/lib/gate-pass-store';
 
 // ── Store singleton ───────────────────────────────────────────────────────────
 let _store: DataStore | null = null;
@@ -638,19 +638,41 @@ function exportDnScanSheet(dn: DeliveryNote) {
 }
 
 // ── Shared PDF export / share-sheet logic (Delivery Note + Gate Pass) ──────────
+// html2canvas/DOM layout renders at ~96dpi; jsPDF units are pt (1/72in).
+const PX_PER_PT = 96 / 72;
+
 async function buildPdfFromElement(el: HTMLElement, orientation: 'portrait' | 'landscape' = 'portrait') {
   const [{ default: html2canvas }, { jsPDF }] = await Promise.all([
     import('html2canvas'),
     import('jspdf'),
   ]);
-  const canvas = await html2canvas(el, {
-    scale: 2, backgroundColor: '#ffffff',
-    ignoreElements: e => e.hasAttribute('data-print-hide'),
-  });
-  const imgData = canvas.toDataURL('image/png');
   const pdf = new jsPDF({ orientation, unit: 'pt', format: 'a4' });
   const pageWidth = pdf.internal.pageSize.getWidth();
   const pageHeight = pdf.internal.pageSize.getHeight();
+
+  // Capture at the PDF's true full page width, not whatever narrower
+  // max-width the element is constrained to on screen for readability —
+  // otherwise text/columns that would reflow wider (and cleaner) in real
+  // print (see the "max-width: none" print override in globals.css) stay
+  // wrapped/cramped as captured on screen and just get stretched, not
+  // reflowed, producing visibly different alignment from real print output.
+  const targetWidthPx = pageWidth * PX_PER_PT;
+  const clone = el.cloneNode(true) as HTMLElement;
+  copyCanvasBitmaps(el, clone);
+  clone.style.cssText = `position:fixed; left:-10000px; top:0; background:#fff; width:${targetWidthPx}px; max-width:none; margin:0;`;
+  document.body.appendChild(clone);
+
+  let canvas;
+  try {
+    canvas = await html2canvas(clone, {
+      scale: 2, backgroundColor: '#ffffff',
+      ignoreElements: e => e.hasAttribute('data-print-hide'),
+    });
+  } finally {
+    document.body.removeChild(clone);
+  }
+
+  const imgData = canvas.toDataURL('image/png');
   const imgWidth = pageWidth;
   const imgHeight = (canvas.height * imgWidth) / canvas.width;
   let heightLeft = imgHeight;
@@ -708,97 +730,113 @@ async function buildDeliveryNotePdf(el: HTMLElement, orientation: 'portrait' | '
     ignoreElements: e => e.hasAttribute('data-print-hide'),
   });
 
-  const table = el.querySelector('table');
-  const children = Array.from(el.children) as HTMLElement[];
-  const tableIndex = table ? children.indexOf(table) : -1;
-  const tbody = table?.querySelector('tbody');
-  const rows = tbody ? (Array.from(tbody.children) as HTMLElement[]) : [];
+  // Measure and cut pages from a full print-width clone, not the on-screen
+  // element itself — the on-screen element is capped to a narrower max-width
+  // for on-screen readability (removed in real print via the "max-width:
+  // none" rule in globals.css), so measuring/capturing from it directly
+  // would pack rows and wrap text as if for that narrower width, producing
+  // different, cramped alignment compared to a real print of the same page.
+  const targetWidthPx = pageWidthPt * PX_PER_PT;
+  const source = el.cloneNode(true) as HTMLElement;
+  copyCanvasBitmaps(el, source);
+  source.style.cssText = `position:fixed; left:-10000px; top:0; background:#fff; width:${targetWidthPx}px; max-width:none; margin:0;`;
+  document.body.appendChild(source);
 
-  if (!table || tableIndex === -1 || rows.length === 0) {
-    const canvas = await capture(el);
-    addCanvasAsPage(canvas, true);
-    return pdf;
-  }
+  try {
+    const table = source.querySelector('table');
+    const children = Array.from(source.children) as HTMLElement[];
+    const tableIndex = table ? children.indexOf(table) : -1;
+    const tbody = table?.querySelector('tbody');
+    const rows = tbody ? (Array.from(tbody.children) as HTMLElement[]) : [];
 
-  const headerNodes = children.slice(0, tableIndex);
-  const footerNodes = children.slice(tableIndex + 1).filter(c => !c.hasAttribute('data-print-hide'));
-  const thead = table.querySelector('thead') as HTMLElement | null;
-
-  const ptPerPx = pageWidthPt / el.offsetWidth;
-  const maxPagePx = pageHeightPt / ptPerPx;
-  const headerPx = headerNodes.reduce((a, n) => a + n.offsetHeight, 0);
-  const footerPx = footerNodes.reduce((a, n) => a + n.offsetHeight, 0);
-  const theadPx = thead?.offsetHeight || 0;
-
-  // Greedily pack rows into pages, leaving room for header + thead (the
-  // footer is intentionally excluded from this budget — it only needs to fit
-  // on the true last page, handled below).
-  const rowBudgetPx = Math.max(100, maxPagePx - headerPx - theadPx - 20);
-  const pages: HTMLElement[][] = [];
-  let current: HTMLElement[] = [];
-  let currentHeight = 0;
-  for (const row of rows) {
-    const h = row.offsetHeight;
-    if (current.length > 0 && currentHeight + h > rowBudgetPx) {
-      pages.push(current);
-      current = [];
-      currentHeight = 0;
+    if (!table || tableIndex === -1 || rows.length === 0) {
+      const canvas = await capture(source);
+      addCanvasAsPage(canvas, true);
+      return pdf;
     }
-    current.push(row);
-    currentHeight += h;
-  }
-  if (current.length > 0) pages.push(current);
-  if (pages.length === 0) pages.push([]);
 
-  // If the footer doesn't fit alongside the last page's rows, bump the
-  // overflowing rows onto a fresh final page so the footer never gets cut off.
-  const lastPageRows = pages[pages.length - 1];
-  if (lastPageRows) {
-    let lastPageRowsHeight = lastPageRows.reduce((a, r) => a + r.offsetHeight, 0);
-    if (headerPx + theadPx + lastPageRowsHeight + footerPx > maxPagePx) {
-      const moved: HTMLElement[] = [];
-      while (lastPageRows.length > 0 && headerPx + theadPx + lastPageRowsHeight + footerPx > maxPagePx) {
-        const popped = lastPageRows.pop();
-        if (!popped) break;
-        moved.unshift(popped);
-        lastPageRowsHeight -= popped.offsetHeight;
+    const headerNodes = children.slice(0, tableIndex);
+    const footerNodes = children.slice(tableIndex + 1).filter(c => !c.hasAttribute('data-print-hide'));
+    const thead = table.querySelector('thead') as HTMLElement | null;
+
+    const ptPerPx = pageWidthPt / targetWidthPx;
+    const maxPagePx = pageHeightPt / ptPerPx;
+    const headerPx = headerNodes.reduce((a, n) => a + n.offsetHeight, 0);
+    const footerPx = footerNodes.reduce((a, n) => a + n.offsetHeight, 0);
+    const theadPx = thead?.offsetHeight || 0;
+
+    // Greedily pack rows into pages, leaving room for header + thead (the
+    // footer is intentionally excluded from this budget — it only needs to fit
+    // on the true last page, handled below).
+    const rowBudgetPx = Math.max(100, maxPagePx - headerPx - theadPx - 20);
+    const pages: HTMLElement[][] = [];
+    let current: HTMLElement[] = [];
+    let currentHeight = 0;
+    for (const row of rows) {
+      const h = row.offsetHeight;
+      if (current.length > 0 && currentHeight + h > rowBudgetPx) {
+        pages.push(current);
+        current = [];
+        currentHeight = 0;
       }
-      if (moved.length > 0) pages.push(moved);
+      current.push(row);
+      currentHeight += h;
     }
-  }
+    if (current.length > 0) pages.push(current);
+    if (pages.length === 0) pages.push([]);
 
-  for (let i = 0; i < pages.length; i++) {
-    const pageRows = pages[i] ?? [];
-    const isLast = i === pages.length - 1;
-
-    const wrapper = document.createElement('div');
-    wrapper.style.cssText = `position:fixed; left:-10000px; top:0; background:#fff; width:${el.offsetWidth}px;`;
-
-    headerNodes.forEach(n => {
-      const clone = n.cloneNode(true) as HTMLElement;
-      copyCanvasBitmaps(n, clone);
-      wrapper.appendChild(clone);
-    });
-
-    const tableClone = table.cloneNode(true) as HTMLTableElement;
-    const tbodyClone = tableClone.querySelector('tbody');
-    if (tbodyClone) {
-      tbodyClone.innerHTML = '';
-      pageRows.forEach(r => tbodyClone.appendChild(r.cloneNode(true)));
-    }
-    wrapper.appendChild(tableClone);
-
-    if (isLast) {
-      footerNodes.forEach(n => wrapper.appendChild(n.cloneNode(true) as HTMLElement));
+    // If the footer doesn't fit alongside the last page's rows, bump the
+    // overflowing rows onto a fresh final page so the footer never gets cut off.
+    const lastPageRows = pages[pages.length - 1];
+    if (lastPageRows) {
+      let lastPageRowsHeight = lastPageRows.reduce((a, r) => a + r.offsetHeight, 0);
+      if (headerPx + theadPx + lastPageRowsHeight + footerPx > maxPagePx) {
+        const moved: HTMLElement[] = [];
+        while (lastPageRows.length > 0 && headerPx + theadPx + lastPageRowsHeight + footerPx > maxPagePx) {
+          const popped = lastPageRows.pop();
+          if (!popped) break;
+          moved.unshift(popped);
+          lastPageRowsHeight -= popped.offsetHeight;
+        }
+        if (moved.length > 0) pages.push(moved);
+      }
     }
 
-    document.body.appendChild(wrapper);
-    try {
-      const canvas = await capture(wrapper);
-      addCanvasAsPage(canvas, i === 0);
-    } finally {
-      document.body.removeChild(wrapper);
+    for (let i = 0; i < pages.length; i++) {
+      const pageRows = pages[i] ?? [];
+      const isLast = i === pages.length - 1;
+
+      const wrapper = document.createElement('div');
+      wrapper.style.cssText = `position:fixed; left:-10000px; top:0; background:#fff; width:${targetWidthPx}px;`;
+
+      headerNodes.forEach(n => {
+        const clone = n.cloneNode(true) as HTMLElement;
+        copyCanvasBitmaps(n, clone);
+        wrapper.appendChild(clone);
+      });
+
+      const tableClone = table.cloneNode(true) as HTMLTableElement;
+      const tbodyClone = tableClone.querySelector('tbody');
+      if (tbodyClone) {
+        tbodyClone.innerHTML = '';
+        pageRows.forEach(r => tbodyClone.appendChild(r.cloneNode(true)));
+      }
+      wrapper.appendChild(tableClone);
+
+      if (isLast) {
+        footerNodes.forEach(n => wrapper.appendChild(n.cloneNode(true) as HTMLElement));
+      }
+
+      document.body.appendChild(wrapper);
+      try {
+        const canvas = await capture(wrapper);
+        addCanvasAsPage(canvas, i === 0);
+      } finally {
+        document.body.removeChild(wrapper);
+      }
     }
+  } finally {
+    document.body.removeChild(source);
   }
 
   return pdf;
@@ -961,6 +999,8 @@ export default function GatePassApp() {
   const [reprintLogs, setReprintLogs] = useState<ReprintLog[]>([]);
   const [plantTags, setPlantTags] = useState<PlantTag[]>([]);
   const [onhandItems, setOnhandItems] = useState<OnhandItem[]>([]);
+  const [notifications, setNotifications] = useState<GPNotification[]>([]);
+  const [notifOpen, setNotifOpen] = useState(false);
   const [onhandSearch, setOnhandSearch] = useState('');
   const [onhandSelected, setOnhandSelected] = useState<Set<string>>(new Set());
 
@@ -1043,6 +1083,29 @@ export default function GatePassApp() {
     setReprintLogs(d.reprintLogs);
     setPlantTags(d.plantTags);
     setOnhandItems(d.onhandItems);
+    // Use the store's own auth (set synchronously inside login()), not the
+    // auth state variable — this can run before a just-completed sign-in's
+    // setAuth has flowed through to a re-render.
+    if (getStore().auth?.role === 'admin') {
+      try { setNotifications(await getStore().listNotifications()); } catch {}
+    }
+  };
+
+  const notifyAdmin = async (dnNo: string, message: string) => {
+    try {
+      await getStore().notifyAdmin(dnNo, message);
+      setToast('Admin notified');
+    } catch (e) { setToast((e as Error).message); }
+  };
+
+  const markNotificationRead = async (id: string) => {
+    setNotifications(prev => prev.map(n => n.id === id ? { ...n, readAt: new Date().toISOString() } : n));
+    try { await getStore().markNotificationRead(id); } catch {}
+  };
+
+  const markAllNotificationsRead = async () => {
+    setNotifications(prev => prev.map(n => n.readAt ? n : { ...n, readAt: new Date().toISOString() }));
+    try { await getStore().markAllNotificationsRead(); } catch {}
   };
 
   // Restore API/local session after refresh
@@ -1709,6 +1772,11 @@ export default function GatePassApp() {
     if (!scanDnNo) return;
     try {
       await getStore().completeDeliveryNote(scanDnNo);
+      if (scanDn) {
+        const totalScanned = scanDn.lines.reduce((a, l) => a + l.serials.length, 0);
+        const totalTarget = scanDn.lines.reduce((a, l) => a + l.deliveryQty, 0);
+        await notifyAdmin(scanDnNo, `${scanDnNo}: ${totalScanned}/${totalTarget} barcodes linked — complete`);
+      }
       await reload();
       setActiveDnNo(scanDnNo);
       setScanDnNo(null);
@@ -1968,6 +2036,51 @@ export default function GatePassApp() {
         <div className="gp-header-subtitle" style={{ fontSize: 13, color: '#a9c9b6', fontWeight: 600 }}>Gate Pass System</div>
         <div style={{ flex: 1 }} />
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          {auth?.role === 'admin' && (
+            <div style={{ position: 'relative' }}>
+              <button
+                onClick={() => setNotifOpen(v => !v)}
+                title="Notifications"
+                style={{ position: 'relative', background: 'rgba(255,255,255,.1)', border: 'none', borderRadius: 8, width: 34, height: 34, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', fontSize: 16, color: C.white, fontFamily: 'inherit' }}
+              >
+                🔔
+                {notifications.some(n => !n.readAt) && (
+                  <span style={{ position: 'absolute', top: -2, right: -2, background: '#d64545', color: '#fff', fontSize: 10, fontWeight: 800, borderRadius: 10, minWidth: 16, height: 16, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '0 3px', border: `2px solid ${C.header}` }}>
+                    {notifications.filter(n => !n.readAt).length > 9 ? '9+' : notifications.filter(n => !n.readAt).length}
+                  </span>
+                )}
+              </button>
+              {notifOpen && (
+                <>
+                  <div onClick={() => setNotifOpen(false)} style={{ position: 'fixed', inset: 0, zIndex: 199 }} />
+                  <div style={{ position: 'absolute', top: 42, right: 0, width: 340, maxHeight: 420, overflowY: 'auto', background: C.white, color: C.text, borderRadius: 12, boxShadow: '0 20px 50px rgba(0,0,0,.28)', zIndex: 200 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '12px 14px', borderBottom: '1px solid #eef1ee' }}>
+                      <div style={{ fontWeight: 700, fontSize: 14 }}>Notifications</div>
+                      {notifications.some(n => !n.readAt) && (
+                        <button onClick={markAllNotificationsRead} style={{ background: 'none', border: 'none', color: C.primary, fontSize: 12, fontWeight: 700, cursor: 'pointer', fontFamily: 'inherit' }}>
+                          Mark all read
+                        </button>
+                      )}
+                    </div>
+                    {notifications.length === 0 ? (
+                      <div style={{ padding: '20px 14px', fontSize: 13, color: '#8b968f' }}>No notifications yet.</div>
+                    ) : (
+                      notifications.map(n => (
+                        <button
+                          key={n.id}
+                          onClick={() => { if (!n.readAt) markNotificationRead(n.id); setActiveDnNo(n.dnNo); setView('admin_view_dn'); setNotifOpen(false); }}
+                          style={{ display: 'block', width: '100%', textAlign: 'left', padding: '12px 14px', borderBottom: '1px solid #f1f4f1', background: n.readAt ? 'none' : '#f3f8f5', border: 'none', cursor: 'pointer', fontFamily: 'inherit' }}
+                        >
+                          <div style={{ fontSize: 13, fontWeight: n.readAt ? 500 : 700, color: C.text }}>{n.message}</div>
+                          <div style={{ fontSize: 11, color: '#9aa39d', marginTop: 3 }}>{n.dnNo} · {n.createdBy} · {new Date(n.createdAt).toLocaleString()}</div>
+                        </button>
+                      ))
+                    )}
+                  </div>
+                </>
+              )}
+            </div>
+          )}
           <div className="gp-header-name" style={{ textAlign: 'right', lineHeight: 1.15 }}>
             <div style={{ fontSize: 13.5, fontWeight: 700 }}>{auth?.name}</div>
             <div style={{ fontSize: 11, color: '#a9c9b6' }}>{auth?.role === 'admin' ? 'Administrator' : 'Garden Incharge'}</div>
@@ -2362,6 +2475,7 @@ export default function GatePassApp() {
                   await reload();
                 } catch (e) { setToast((e as Error).message); }
               }}
+              onNotifyAdmin={notifyAdmin}
             />
           )}
 
@@ -3554,6 +3668,7 @@ export default function GatePassApp() {
               onRemoveSerial={async (slNo, code) => { await removeSerial(scanDn.no, slNo, code); await reload(); }}
               onComplete={completeDn}
               onBack={() => setView(auth?.role === 'admin' ? 'admin_dns' : 'garden_scanning')}
+              onNotifyAdmin={notifyAdmin}
             />
           )}
 
@@ -3845,17 +3960,18 @@ function DnHeaderField({ label, value, onChange, editMode, align, minWidth = 96,
   );
 }
 
-function ViewDeliveryNote({ dn, gp, role, scanned, target, onBack, onContinueScan, onRemoveSerial, onPrint, onSaveHeader, onSaveLine, onSaveDoRef, onSaveGpRefs, onRemoveLine, onAddAttachment, onRemoveAttachment }: {
+function ViewDeliveryNote({ dn, gp, role, scanned, target, onBack, onContinueScan, onRemoveSerial, onPrint, onSaveHeader, onSaveLine, onSaveDoRef, onSaveGpRefs, onRemoveLine, onAddAttachment, onRemoveAttachment, onNotifyAdmin }: {
   dn: DeliveryNote; gp: GatePass | null; role: string; scanned: number; target: number;
   onBack: () => void; onContinueScan: () => void;
   onRemoveSerial: (slNo: number, code: string) => void; onPrint: () => void;
   onSaveHeader: (dnNo: string, form: { customerProject: string; vhNumber: string; project: string; date: string }) => void;
-  onSaveLine: (dnNo: string, slNo: number, form: { postedQty: string; remarks: string }) => void;
+  onSaveLine: (dnNo: string, slNo: number, form: { postedQty: string; remarks: string; deliveryQty?: number }) => void;
   onSaveDoRef: (dnNo: string, slNo: number, doRef: string) => void;
   onSaveGpRefs: (gpNo: string, form: { soRef: string; prRef: string; lpoNo: string }) => void;
   onRemoveLine: (dnNo: string, slNo: number) => void;
   onAddAttachment: (dnNo: string, file: { name: string; type: string; size: number; dataUrl: string }) => void;
   onRemoveAttachment: (dnNo: string, attachmentId: string) => void;
+  onNotifyAdmin: (dnNo: string, message: string) => void;
 }) {
   const isComplete = dn.status === 'completed';
   const isScanning = dn.status === 'scanning';
@@ -3874,20 +3990,24 @@ function ViewDeliveryNote({ dn, gp, role, scanned, target, onBack, onContinueSca
   useEffect(() => { setGpRefsForm({ soRef: gp?.soRef || '', prRef: gp?.prRef || '', lpoNo: gp?.lpoNo || '' }); }, [gp?.no]);
   const updateGpRefsField = (field: keyof typeof gpRefsForm, v: string) => setGpRefsForm(prev => ({ ...prev, [field]: v }));
 
-  const [lineForm, setLineForm] = useState<Record<number, { postedQty: string; remarks: string }>>({});
+  const [lineForm, setLineForm] = useState<Record<number, { postedQty: string; remarks: string; deliveryQty: string; doRef: string }>>({});
   useEffect(() => {
-    const obj: Record<number, { postedQty: string; remarks: string }> = {};
-    dn.lines.forEach(l => { obj[l.slNo] = { postedQty: l.postedQty, remarks: l.remarks }; });
+    const obj: Record<number, { postedQty: string; remarks: string; deliveryQty: string; doRef: string }> = {};
+    dn.lines.forEach(l => { obj[l.slNo] = { postedQty: l.postedQty, remarks: l.remarks, deliveryQty: String(l.deliveryQty), doRef: l.doRef }; });
     setLineForm(obj);
-  }, [dn]);
-  const updateLineField = (slNo: number, field: 'postedQty' | 'remarks', v: string) =>
+    // Keyed on dn.no (not dn) — the background poll/focus refresh replaces
+    // dn with a new object every ~15s even when nothing changed. Resyncing
+    // on every such reference change would wipe an in-progress edit back to
+    // the last-saved value while the user is still typing.
+  }, [dn.no]);
+  const updateLineField = (slNo: number, field: 'postedQty' | 'remarks' | 'deliveryQty' | 'doRef', v: string) =>
     setLineForm(prev => {
-      const current = prev[slNo] || { postedQty: '', remarks: '' };
+      const current = prev[slNo] || { postedQty: '', remarks: '', deliveryQty: '', doRef: '' };
       return { ...prev, [slNo]: { ...current, [field]: v } };
     });
 
   const [pendingRemovals, setPendingRemovals] = useState<Set<number>>(new Set());
-  useEffect(() => { setPendingRemovals(new Set()); }, [dn]);
+  useEffect(() => { setPendingRemovals(new Set()); }, [dn.no]);
   const toggleRemoveLine = (slNo: number) => setPendingRemovals(prev => {
     const next = new Set(prev);
     if (next.has(slNo)) next.delete(slNo);
@@ -3895,8 +4015,9 @@ function ViewDeliveryNote({ dn, gp, role, scanned, target, onBack, onContinueSca
     return next;
   });
 
-  // Mandatory DO Reference gate: fires once at Save time (not per line as you type) for any
-  // line whose SYS Posted Qty just changed and still has no DO Reference.
+  // DO Reference review gate: fires once at Save time (not per line as you type) for
+  // every line whose SYS Posted Qty just changed, pre-filled from whatever's already
+  // there (inline draft or saved value) — a non-empty DO Reference is mandatory for all of them.
   const [doRefModal, setDoRefModal] = useState<{ lines: DNLine[]; values: Record<number, string> } | null>(null);
 
   const attachFileRef = useRef<HTMLInputElement>(null);
@@ -3925,8 +4046,8 @@ function ViewDeliveryNote({ dn, gp, role, scanned, target, onBack, onContinueSca
   const cancelEdit = () => {
     setHeaderForm({ customerProject: dn.customerProject, vhNumber: dn.vhNumber, project: dn.project, date: dn.date });
     setGpRefsForm({ soRef: gp?.soRef || '', prRef: gp?.prRef || '', lpoNo: gp?.lpoNo || '' });
-    const obj: Record<number, { postedQty: string; remarks: string }> = {};
-    dn.lines.forEach(l => { obj[l.slNo] = { postedQty: l.postedQty, remarks: l.remarks }; });
+    const obj: Record<number, { postedQty: string; remarks: string; deliveryQty: string; doRef: string }> = {};
+    dn.lines.forEach(l => { obj[l.slNo] = { postedQty: l.postedQty, remarks: l.remarks, deliveryQty: String(l.deliveryQty), doRef: l.doRef }; });
     setLineForm(obj);
     setPendingRemovals(new Set());
     setEditMode(false);
@@ -3938,9 +4059,11 @@ function ViewDeliveryNote({ dn, gp, role, scanned, target, onBack, onContinueSca
     dn.lines.forEach(l => {
       if (pendingRemovals.has(l.slNo)) return;
       const form = lineForm[l.slNo];
-      if (form) onSaveLine(dn.no, l.slNo, form);
-      const doRefVal = doRefValues[l.slNo];
-      if (doRefVal !== undefined) onSaveDoRef(dn.no, l.slNo, doRefVal);
+      if (form) onSaveLine(dn.no, l.slNo, { postedQty: form.postedQty, remarks: form.remarks, deliveryQty: Number(form.deliveryQty) });
+      // The modal's value (for anything left blank at Save time) wins over
+      // whatever was typed inline; otherwise fall back to the inline draft.
+      const doRefVal = doRefValues[l.slNo] !== undefined ? doRefValues[l.slNo] : form?.doRef;
+      if (doRefVal !== undefined && doRefVal !== l.doRef) onSaveDoRef(dn.no, l.slNo, doRefVal);
     });
     pendingRemovals.forEach(slNo => onRemoveLine(dn.no, slNo));
     setEditMode(false);
@@ -3953,10 +4076,14 @@ function ViewDeliveryNote({ dn, gp, role, scanned, target, onBack, onContinueSca
       const form = lineForm[l.slNo];
       return !!form && form.postedQty !== l.postedQty;
     });
-    const needingDoRef = changedLines.filter(l => !l.doRef);
-
-    if (needingDoRef.length > 0) {
-      setDoRefModal({ lines: needingDoRef, values: Object.fromEntries(needingDoRef.map(l => [l.slNo, ''])) });
+    // Every line whose Posted Qty changed gets a review row in the popup —
+    // pre-filled with whatever DO Ref is already there (inline draft or saved
+    // value) — so DO Ref for the whole batch can be confirmed/edited in one place.
+    if (changedLines.length > 0) {
+      setDoRefModal({
+        lines: changedLines,
+        values: Object.fromEntries(changedLines.map(l => [l.slNo, lineForm[l.slNo]?.doRef ?? l.doRef])),
+      });
     } else {
       finalizeSave();
     }
@@ -4018,33 +4145,64 @@ function ViewDeliveryNote({ dn, gp, role, scanned, target, onBack, onContinueSca
 
             const renderRow = (ln: DNLine, displaySlNo: number) => {
               const marked = pendingRemovals.has(ln.slNo);
+              // Locking is based on the committed (saved) status, not the draft below —
+              // otherwise the input would vanish mid-typing the moment the draft value
+              // reaches the closing quantity.
               const status = lineStatus(ln.postedQty, ln.deliveryQty);
+              const locked = status === 'Closed';
+              // Status badge and remaining qty reflect the draft as-you-type, so admins
+              // see the line close out immediately rather than only after Save.
+              const draftPostedQty = editMode ? (lineForm[ln.slNo]?.postedQty ?? ln.postedQty) : ln.postedQty;
+              const draftDeliveryQty = editMode ? (Number(lineForm[ln.slNo]?.deliveryQty) || 0) : ln.deliveryQty;
+              const liveStatus = lineStatus(draftPostedQty, draftDeliveryQty);
+              const liveRemainingQty = String(Math.max(0, draftDeliveryQty - (Number(draftPostedQty) || 0)));
               const rowStyle: React.CSSProperties = marked ? { opacity: 0.45, textDecoration: 'line-through' } : {};
               return (
                 <tr key={ln.slNo} style={rowStyle}>
                   <td style={{ border: '1px solid #1f2a24', padding: 9, textAlign: 'center', fontSize: 13.5 }}>{displaySlNo}</td>
                   <td style={{ border: '1px solid #1f2a24', padding: 9, fontSize: 13.5, fontWeight: 600 }}>{ln.plantName}</td>
                   <td style={{ border: '1px solid #1f2a24', padding: 9, textAlign: 'center', fontSize: 13.5 }}>{ln.spec}</td>
-                  <td style={{ border: '1px solid #1f2a24', padding: 9, textAlign: 'center', fontSize: 13.5, fontWeight: 700 }}>{ln.deliveryQty}</td>
+                  <td style={{ border: '1px solid #1f2a24', padding: 6, textAlign: 'center', fontSize: 13.5, fontWeight: 700 }}>
+                    {role === 'admin' && editMode && !marked && !locked ? (
+                      <TInp
+                        value={lineForm[ln.slNo]?.deliveryQty ?? String(ln.deliveryQty)}
+                        onChange={v => updateLineField(ln.slNo, 'deliveryQty', v)}
+                        style={{ textAlign: 'center' }}
+                      />
+                    ) : (
+                      ln.deliveryQty
+                    )}
+                  </td>
                   <td data-print-hide style={{ border: '1px solid #1f2a24', padding: 6, textAlign: 'center' }}>
-                    {role === 'admin' && editMode && !marked ? (
+                    {role === 'admin' && editMode && !marked && !locked ? (
                       <TInp
                         value={lineForm[ln.slNo]?.postedQty ?? ln.postedQty}
                         onChange={v => updateLineField(ln.slNo, 'postedQty', v)}
                         style={{ textAlign: 'center' }}
                       />
                     ) : (
-                      <span style={{ fontSize: 13.5 }}>{ln.postedQty}</span>
+                      <span style={{ fontSize: 13.5 }} title={locked ? 'Line is closed — posted qty is locked' : undefined}>{ln.postedQty}</span>
                     )}
                   </td>
-                  <td data-print-hide style={{ border: '1px solid #1f2a24', padding: 9, textAlign: 'center', fontSize: 13.5 }}>{ln.remainingQty}</td>
+                  <td data-print-hide style={{ border: '1px solid #1f2a24', padding: 9, textAlign: 'center', fontSize: 13.5 }}>{liveRemainingQty}</td>
                   <td data-print-hide style={{ border: '1px solid #1f2a24', padding: 9, textAlign: 'center' }}>
-                    <span style={{ fontSize: 10.5, fontWeight: 700, padding: '3px 8px', borderRadius: 20, ...statusColors(status) }}>
-                      {marked ? 'REMOVING' : status.toUpperCase()}
+                    <span style={{ fontSize: 10.5, fontWeight: 700, padding: '3px 8px', borderRadius: 20, ...statusColors(liveStatus) }}>
+                      {marked ? 'REMOVING' : liveStatus.toUpperCase()}
                     </span>
                   </td>
                   <td style={{ border: '1px solid #1f2a24', padding: 9, textAlign: 'center', fontSize: 13.5 }}>{ln.location}</td>
-                  <td data-print-hide style={{ border: '1px solid #1f2a24', padding: 9, textAlign: 'center', fontSize: 13.5 }}>{ln.doRef || '—'}</td>
+                  <td data-print-hide style={{ border: '1px solid #1f2a24', padding: 6, textAlign: 'center' }}>
+                    {editMode && !marked ? (
+                      <TInp
+                        value={lineForm[ln.slNo]?.doRef ?? ln.doRef}
+                        onChange={v => updateLineField(ln.slNo, 'doRef', v)}
+                        placeholder="DO Ref"
+                        style={{ textAlign: 'center' }}
+                      />
+                    ) : (
+                      <span style={{ fontSize: 13.5 }}>{ln.doRef || '—'}</span>
+                    )}
+                  </td>
                   <td data-print-hide style={{ border: '1px solid #1f2a24', padding: 6 }}>
                     {editMode && !marked ? (
                       <TInp
@@ -4057,7 +4215,7 @@ function ViewDeliveryNote({ dn, gp, role, scanned, target, onBack, onContinueSca
                     )}
                   </td>
                   <td data-print-hide style={{ border: '1px solid #1f2a24', padding: 9, textAlign: 'center' }}>
-                    {role === 'admin' && editMode && ln.serials.length === 0 && (marked || visibleLineCount > 1) ? (
+                    {role === 'admin' && editMode && ln.serials.length === 0 && !locked && (marked || visibleLineCount > 1) ? (
                       <button
                         onClick={() => toggleRemoveLine(ln.slNo)}
                         title={marked ? 'Undo — keep this line' : 'Cancel this line (applied on Save)'}
@@ -4166,7 +4324,17 @@ function ViewDeliveryNote({ dn, gp, role, scanned, target, onBack, onContinueSca
       <div data-print-hide style={{ background: '#fff', border: '1px solid #e2e7e3', borderRadius: 12, maxWidth: 920, margin: '18px auto 0', overflow: 'hidden' }}>
         <div style={{ padding: '16px 20px', borderBottom: '1px solid #eef1ee', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
           <div style={{ fontWeight: 700, fontSize: 16 }}>Linked Barcodes</div>
-          <div style={{ fontSize: 13, fontWeight: 700, color: C.primary, fontVariantNumeric: 'tabular-nums' }}>{scanned} / {target} scanned</div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
+            <div style={{ fontSize: 13, fontWeight: 700, color: C.primary, fontVariantNumeric: 'tabular-nums' }}>{scanned} / {target} scanned</div>
+            {role === 'garden' && (
+              <Btn
+                onClick={() => onNotifyAdmin(dn.no, `${dn.no}: ${scanned}/${target} barcodes linked${scanned < target ? ' — partial submission' : ' — complete'} (Vehicle ${dn.vhNumber || '—'})`)}
+                style={{ background: C.white, border: `1px solid ${C.primary}`, color: C.primary, borderRadius: 9, padding: '7px 13px', fontSize: 12.5, fontWeight: 700, cursor: 'pointer' }}
+              >
+                🔔 Notify Admin
+              </Btn>
+            )}
+          </div>
         </div>
         <div style={{ padding: '8px 20px 20px' }}>
           {dn.lines.map(ln => {
@@ -4259,7 +4427,7 @@ function ViewDeliveryNote({ dn, gp, role, scanned, target, onBack, onContinueSca
             </p>
             {doRefModal.lines.map(l => (
               <div key={l.slNo} style={{ marginBottom: 14 }}>
-                <FieldLabel>{l.slNo}. {l.plantName} — DO Reference *</FieldLabel>
+                <FieldLabel>{l.slNo}. {l.plantName} — Posted Qty {l.postedQty} → {lineForm[l.slNo]?.postedQty ?? l.postedQty} — DO Reference *</FieldLabel>
                 <Inp
                   value={doRefModal.values[l.slNo] ?? ''}
                   onChange={v => setDoRefModal(prev => prev && { ...prev, values: { ...prev.values, [l.slNo]: v } })}
@@ -4346,7 +4514,7 @@ function GardenDnCard({ dn, scanned, target, onScan, onView }: {
 
 function ScanScreen({
   dn, activeSlNo, scanInput, feedback, inputRef,
-  onScanInput, onScanKey, onSimulate, onSelectLine, onRemoveSerial, onComplete, onBack,
+  onScanInput, onScanKey, onSimulate, onSelectLine, onRemoveSerial, onComplete, onBack, onNotifyAdmin,
 }: {
   dn: DeliveryNote; activeSlNo: number;
   scanInput: string; feedback: { msg: string; ok: boolean } | null;
@@ -4358,6 +4526,7 @@ function ScanScreen({
   onRemoveSerial: (slNo: number, code: string) => void;
   onComplete: () => void;
   onBack: () => void;
+  onNotifyAdmin: (dnNo: string, message: string) => void;
 }) {
   const totalScanned = dn.lines.reduce((a, l) => a + l.serials.length, 0);
   const totalTarget  = dn.lines.reduce((a, l) => a + l.deliveryQty, 0);
@@ -4420,6 +4589,14 @@ function ScanScreen({
               Scan all required barcodes to complete · <b>{totalTarget - totalScanned}</b> remaining
             </div>
           )}
+          {/* Available for every submission of linked barcodes, not just partial ones —
+              Complete already auto-notifies, but admins may want an update mid-scan too. */}
+          <Btn
+            onClick={() => onNotifyAdmin(dn.no, `${dn.no}: ${totalScanned}/${totalTarget} barcodes linked${allDone ? ' — complete' : ' — partial submission'}`)}
+            style={{ width: '100%', marginTop: 10, background: C.white, border: `1px solid ${C.primary}`, color: C.primary, borderRadius: 11, padding: 12, fontSize: 13.5, fontWeight: 700, cursor: 'pointer', fontFamily: 'inherit' }}
+          >
+            🔔 Notify Admin
+          </Btn>
         </div>
 
         {/* Line list */}

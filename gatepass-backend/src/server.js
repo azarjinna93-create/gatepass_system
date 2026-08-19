@@ -8,6 +8,7 @@ import deliveryNoteRoutes from './routes/deliveryNotes.js';
 import gatePassRoutes from './routes/gatePasses.js';
 import mastersRoutes from './routes/masters.js';
 import usersRoutes from './routes/users.js';
+import notificationsRoutes from './routes/notifications.js';
 
 dotenv.config();
 
@@ -31,6 +32,7 @@ app.use('/api/gate-passes', gatePassRoutes);
 app.use('/api/delivery-notes', deliveryNoteRoutes);
 app.use('/api/masters', mastersRoutes);
 app.use('/api/users', usersRoutes);
+app.use('/api/notifications', notificationsRoutes);
 
 app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 

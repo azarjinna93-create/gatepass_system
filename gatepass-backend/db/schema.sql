@@ -151,6 +151,18 @@ CREATE TABLE serials (
   UNIQUE (dn_line_id, code)
 );
 
+-- Admin notification broadcast log (e.g. "garden submitted a partial scan").
+-- Not tied by foreign key to delivery_notes — it's a standalone log, kept
+-- even if the underlying DN record changes.
+CREATE TABLE notifications (
+  id          SERIAL PRIMARY KEY,
+  dn_no       TEXT NOT NULL,
+  message     TEXT NOT NULL,
+  created_by  TEXT,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  read_at     TIMESTAMPTZ
+);
+
 ALTER TABLE gate_passes
   ADD CONSTRAINT fk_gp_delivery_note
   FOREIGN KEY (delivery_note_id) REFERENCES delivery_notes(id) ON DELETE SET NULL;
@@ -160,5 +172,6 @@ CREATE INDEX idx_dn_lines_dn  ON delivery_note_lines (dn_id);
 CREATE INDEX idx_serials_line ON serials (dn_line_id);
 CREATE INDEX idx_dn_gp        ON delivery_notes (gp_id);
 CREATE INDEX idx_gp_dn        ON gate_passes (delivery_note_id);
+CREATE INDEX idx_notifications_unread ON notifications (id) WHERE read_at IS NULL;
 
 COMMIT;

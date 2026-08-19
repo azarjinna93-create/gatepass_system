@@ -150,6 +150,17 @@ export interface ReprintLog {
   createdAt: string;
 }
 
+// Broadcast to all admins — read state isn't per-user, any admin dismissing
+// it clears it for everyone (small-team assumption, matches the two-role model).
+export interface GPNotification {
+  id: string;
+  dnNo: string;
+  message: string;
+  createdBy: string;
+  createdAt: string;
+  readAt: string | null;
+}
+
 // Standalone plant tag / label print (not tied to a Gate Pass or Delivery Note) —
 // scanned SRL# is checked for duplicates before a new tag is created.
 export interface PlantTag {
@@ -234,7 +245,7 @@ export interface DataStore {
   updateGatePass(no: string, form: GatePassForm): Promise<GatePass>;
   createDeliveryNote(form: DeliveryNoteForm): Promise<DeliveryNote>;
   updateDeliveryNoteHeader(dnNo: string, form: { customerProject: string; vhNumber: string; project: string; date: string }): Promise<DeliveryNote>;
-  updateDeliveryNoteLine(dnNo: string, slNo: number, form: { postedQty: string; remarks: string }): Promise<DeliveryNote>;
+  updateDeliveryNoteLine(dnNo: string, slNo: number, form: { postedQty: string; remarks: string; deliveryQty?: number }): Promise<DeliveryNote>;
   updateDeliveryNoteLineDoRef(dnNo: string, slNo: number, doRef: string): Promise<DeliveryNote>;
   updateGatePassHeaderRefs(gpNo: string, form: { soRef: string; prRef: string; lpoNo: string }): Promise<GatePass>;
   splitDeliveryNoteLine(dnNo: string, slNo: number): Promise<DeliveryNote>;
@@ -259,12 +270,17 @@ export interface DataStore {
   createUserAccount(form: { username: string; password: string; role: 'admin' | 'garden' }): Promise<UserAccount>;
   resetPassword(id: string, newPassword: string): Promise<UserAccount>;
   deleteUserAccount(id: string): Promise<void>;
+  listNotifications(): Promise<GPNotification[]>;
+  notifyAdmin(dnNo: string, message: string): Promise<GPNotification>;
+  markNotificationRead(id: string): Promise<void>;
+  markAllNotificationsRead(): Promise<void>;
 }
 
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 const LS_KEY = 'acacia_gp_v3';
+const NOTIF_KEY = 'acacia_gp_notifications_v1';
 
 function pad2(n: number) {
   return String(n).padStart(2, '0');
@@ -557,12 +573,16 @@ export class LocalStore implements DataStore {
     return updated;
   }
 
-  async updateDeliveryNoteLine(dnNo: string, slNo: number, form: { postedQty: string; remarks: string }): Promise<DeliveryNote> {
+  async updateDeliveryNoteLine(dnNo: string, slNo: number, form: { postedQty: string; remarks: string; deliveryQty?: number }): Promise<DeliveryNote> {
     const data = this.read();
     const dn = data.dns.find(d => d.no === dnNo);
     if (!dn) throw new Error('Delivery note not found');
     const line = dn.lines.find(l => l.slNo === slNo);
     if (!line) throw new Error('Delivery note line not found');
+    const wasClosed = (Number(line.postedQty) || 0) >= (line.deliveryQty || 0);
+    const changingQty = (form.deliveryQty != null && form.deliveryQty !== line.deliveryQty) || form.postedQty !== line.postedQty;
+    if (wasClosed && changingQty) throw new Error('This line is closed — qty and posted qty can no longer be edited');
+    if (form.deliveryQty != null) line.deliveryQty = form.deliveryQty;
     line.postedQty = form.postedQty;
     const target = line.deliveryQty || 0;
     const posted = Number(form.postedQty) || 0;
@@ -634,6 +654,7 @@ export class LocalStore implements DataStore {
     if (!line) throw new Error('Delivery note line not found');
     if (dn.lines.length <= 1) throw new Error('A delivery note must have at least one line');
     if (line.serials.length > 0) throw new Error('Cannot remove — barcodes have already been scanned against this line');
+    if ((Number(line.postedQty) || 0) >= (line.deliveryQty || 0)) throw new Error('This line is closed and cannot be removed');
     dn.lines = dn.lines.filter(l => l.slNo !== slNo);
     dn.modifiedBy = this.auth?.name || 'Admin';
     dn.modifiedAt = today();
@@ -909,6 +930,45 @@ export class LocalStore implements DataStore {
     this.write({ ...data, users: data.users.map(u => u.id === id ? updated : u) });
     return updated;
   }
+
+  // Kept in a separate localStorage key rather than folded into AppData —
+  // notifications are an independent broadcast log, not part of the core
+  // gate-pass/delivery-note record the rest of this store manages.
+  private readNotifications(): GPNotification[] {
+    if (typeof window === 'undefined') return [];
+    try {
+      const raw = localStorage.getItem(NOTIF_KEY);
+      return raw ? (JSON.parse(raw) as GPNotification[]) : [];
+    } catch { return []; }
+  }
+
+  private writeNotifications(list: GPNotification[]) {
+    try { localStorage.setItem(NOTIF_KEY, JSON.stringify(list)); } catch {}
+  }
+
+  async listNotifications(): Promise<GPNotification[]> {
+    return this.readNotifications().sort((a, b) => b.id.localeCompare(a.id));
+  }
+
+  async notifyAdmin(dnNo: string, message: string): Promise<GPNotification> {
+    const n: GPNotification = {
+      id: nanoid(), dnNo, message,
+      createdBy: this.auth?.name || 'Garden Incharge',
+      createdAt: new Date().toISOString(),
+      readAt: null,
+    };
+    this.writeNotifications([n, ...this.readNotifications()]);
+    return n;
+  }
+
+  async markNotificationRead(id: string): Promise<void> {
+    this.writeNotifications(this.readNotifications().map(n => n.id === id ? { ...n, readAt: new Date().toISOString() } : n));
+  }
+
+  async markAllNotificationsRead(): Promise<void> {
+    const now = new Date().toISOString();
+    this.writeNotifications(this.readNotifications().map(n => n.readAt ? n : { ...n, readAt: now }));
+  }
 }
 
 // ── API Store (Express + Postgres backend) ───────────────────────────────────
@@ -1028,7 +1088,7 @@ export class ApiStore implements DataStore {
     });
   }
 
-  async updateDeliveryNoteLine(dnNo: string, slNo: number, form: { postedQty: string; remarks: string }): Promise<DeliveryNote> {
+  async updateDeliveryNoteLine(dnNo: string, slNo: number, form: { postedQty: string; remarks: string; deliveryQty?: number }): Promise<DeliveryNote> {
     return this.request(`/api/delivery-notes/${encodeURIComponent(dnNo)}/lines/${slNo}`, {
       method: 'PATCH',
       body: JSON.stringify(form),
@@ -1151,6 +1211,22 @@ export class ApiStore implements DataStore {
 
   async deleteUserAccount(id: string): Promise<void> {
     await this.request(`/api/users/${encodeURIComponent(id)}`, { method: 'DELETE' });
+  }
+
+  async listNotifications(): Promise<GPNotification[]> {
+    return this.request('/api/notifications');
+  }
+
+  async notifyAdmin(dnNo: string, message: string): Promise<GPNotification> {
+    return this.request('/api/notifications', { method: 'POST', body: JSON.stringify({ dnNo, message }) });
+  }
+
+  async markNotificationRead(id: string): Promise<void> {
+    await this.request(`/api/notifications/${encodeURIComponent(id)}/read`, { method: 'PATCH' });
+  }
+
+  async markAllNotificationsRead(): Promise<void> {
+    await this.request('/api/notifications/read-all', { method: 'PATCH' });
   }
 }
 

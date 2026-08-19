@@ -248,13 +248,20 @@ router.patch('/:no/lines/:slNo', requireRole('admin', 'garden'), async (req, res
           [b.doRef ?? '', line.id]
         );
       } else {
+        const deliveryQty = b.deliveryQty != null ? Number(b.deliveryQty) : Number(line.delivery_qty) || 0;
         const postedQty = b.postedQty != null ? String(b.postedQty) : String(line.posted_qty ?? '0');
         const posted = Number(postedQty) || 0;
-        const target = Number(line.delivery_qty) || 0;
-        const remainingQty = String(Math.max(0, target - posted));
+
+        const wasClosed = (Number(line.posted_qty) || 0) >= (Number(line.delivery_qty) || 0);
+        const changingQty = deliveryQty !== (Number(line.delivery_qty) || 0) || postedQty !== String(line.posted_qty ?? '0');
+        if (wasClosed && changingQty) {
+          throw Object.assign(new Error('This line is closed — qty and posted qty can no longer be edited'), { status: 409 });
+        }
+
+        const remainingQty = String(Math.max(0, deliveryQty - posted));
         await c.query(
-          `UPDATE delivery_note_lines SET posted_qty = $1, remaining_qty = $2, remarks = $3 WHERE id = $4`,
-          [postedQty, remainingQty, b.remarks != null ? b.remarks : (line.remarks || ''), line.id]
+          `UPDATE delivery_note_lines SET delivery_qty = $1, posted_qty = $2, remaining_qty = $3, remarks = $4 WHERE id = $5`,
+          [deliveryQty, postedQty, remainingQty, b.remarks != null ? b.remarks : (line.remarks || ''), line.id]
         );
       }
       await touchDn(c, dn.id, actor(req));
@@ -334,6 +341,10 @@ router.delete('/:no/lines/:slNo', requireRole('admin', 'garden'), async (req, re
           new Error('Cannot remove — barcodes have already been scanned against this line'),
           { status: 409 }
         );
+      }
+
+      if ((Number(line.posted_qty) || 0) >= (Number(line.delivery_qty) || 0)) {
+        throw Object.assign(new Error('This line is closed and cannot be removed'), { status: 409 });
       }
 
       await c.query('DELETE FROM delivery_note_lines WHERE id = $1', [line.id]);
