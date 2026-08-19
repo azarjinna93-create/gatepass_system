@@ -25,7 +25,8 @@ router.post('/login', async (req, res, next) => {
       user: { id: user.id, username: user.username, name: user.display_name, role: user.role },
     });
   } catch (err) {
-    next(err);
+    console.error('Login failed:', err);
+    res.status(500).json({ error: err.message || 'Internal server error' });
   }
 });
 
