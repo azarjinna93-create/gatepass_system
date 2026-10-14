@@ -1184,6 +1184,31 @@ export default function GatePassApp() {
     setView('login_roles');
   };
 
+  // Auto-sign-out after 30 minutes with no activity — a shared desk/kiosk
+  // left logged in indefinitely means anyone walking up can create or edit
+  // documents under whoever's still signed in. Any mouse/keyboard/touch
+  // input resets the timer; a barcode scanner emits keydown events too, so
+  // an active scanning session is never signed out mid-task.
+  useEffect(() => {
+    if (!auth) return;
+    const IDLE_LIMIT_MS = 30 * 60 * 1000;
+    let timer: ReturnType<typeof setTimeout>;
+    const resetTimer = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        setToast('Signed out due to 30 minutes of inactivity');
+        void logout();
+      }, IDLE_LIMIT_MS);
+    };
+    const events = ['mousedown', 'mousemove', 'keydown', 'touchstart', 'scroll', 'wheel'] as const;
+    events.forEach(e => window.addEventListener(e, resetTimer, { passive: true }));
+    resetTimer();
+    return () => {
+      clearTimeout(timer);
+      events.forEach(e => window.removeEventListener(e, resetTimer));
+    };
+  }, [auth]);
+
   // ── GP form handlers (Admin creates — Step 1) ──
   const openNewGp = () => {
     setEditingGpNo(null);
