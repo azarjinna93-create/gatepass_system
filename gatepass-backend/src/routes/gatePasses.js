@@ -78,13 +78,71 @@ function actor(req) {
   return req.user.name || req.user.username;
 }
 
+// Same shape as loadGatePass(), but for the whole list in one round trip
+// instead of looping per-row (that loop was 3 extra queries per gate pass —
+// the #1 cause of the list getting slower as history grows). Lines are
+// aggregated server-side with json_agg so Postgres does the join, not Node.
+async function listGatePassesFast(client) {
+  const { rows } = await client.query(`
+    SELECT
+      gp.*,
+      dn.no AS dn_no,
+      COALESCE(lines_agg.lines, '[]'::json) AS lines_json
+    FROM gate_passes gp
+    LEFT JOIN delivery_notes dn ON dn.id = gp.delivery_note_id
+    LEFT JOIN LATERAL (
+      SELECT json_agg(
+        json_build_object(
+          'slNo', gpl.sl_no, 'plantCode', gpl.plant_code, 'plantDesc', gpl.plant_desc,
+          'potSize', gpl.pot_size, 'height', gpl.height, 'girth', gpl.girth, 'spread', gpl.spread,
+          'unit', gpl.unit, 'qty', gpl.qty, 'postedQty', gpl.posted_qty,
+          'remainingQty', gpl.remaining_qty, 'location', gpl.location
+        ) ORDER BY gpl.sl_no
+      ) AS lines
+      FROM gate_pass_lines gpl
+      WHERE gpl.gp_id = gp.id
+    ) lines_agg ON true
+    ORDER BY gp.id DESC
+  `);
+  return rows.map(gp => ({
+    no: gp.no,
+    doNo: gp.do_no || '',
+    doDate: gp.do_date || '',
+    lpoNo: gp.lpo_no || '',
+    lpoDate: gp.lpo_date || '',
+    prRef: gp.pr_ref || '',
+    soRef: gp.so_ref || '',
+    customerName: gp.customer_name,
+    customerCode: gp.customer_code || '',
+    project: gp.project || '',
+    party: gp.party || '',
+    assignedTo: gp.assigned_to || [],
+    createdBy: gp.created_by || '',
+    createdAt: formatDate(gp.created_at) || '',
+    modifiedBy: gp.modified_by || null,
+    modifiedAt: gp.modified_at ? formatDate(gp.modified_at) : null,
+    dnNo: gp.dn_no || null,
+    lines: (gp.lines_json || []).map(l => ({
+      slNo: l.slNo,
+      plantCode: l.plantCode || '',
+      plantDesc: l.plantDesc || '',
+      potSize: l.potSize || '',
+      height: l.height || '',
+      girth: l.girth || '',
+      spread: l.spread || '',
+      unit: l.unit || 'Nos',
+      qty: String(l.qty ?? 0),
+      postedQty: String(l.postedQty ?? 0),
+      remainingQty: String(l.remainingQty ?? 0),
+      location: l.location || '',
+    })),
+  }));
+}
+
 // GET /api/gate-passes
 router.get('/', async (req, res, next) => {
   try {
-    const ids = (await pool.query('SELECT id FROM gate_passes ORDER BY id DESC')).rows.map(r => r.id);
-    const out = [];
-    for (const id of ids) out.push(await loadGatePass(pool, id));
-    res.json(out);
+    res.json(await listGatePassesFast(pool));
   } catch (err) { next(err); }
 });
 
@@ -236,4 +294,4 @@ router.patch('/:no/refs', requireRole('admin', 'garden'), async (req, res, next)
 });
 
 export default router;
-export { loadGatePass };
+export { loadGatePass, listGatePassesFast };

@@ -98,6 +98,95 @@ async function loadDeliveryNote(client, dnId) {
   };
 }
 
+// Same shape as loadDeliveryNote(), but for the whole list in one round trip.
+// The old GET /api/delivery-notes looped per-row doing a lines query, then a
+// serials query PER LINE, then an attachments query — easily thousands of
+// sequential round trips once there's real history, and it's polled every
+// 15s from the UI. This does it in one query with json_agg/LATERAL joins.
+//
+// Attachment `dataUrl` (base64, up to 8MB each) is deliberately left out of
+// this list — it was being re-downloaded by every poll for every DN that had
+// a photo attached. Metadata only here; fetch the real file via
+// GET /api/delivery-notes/:no/attachments/:attachmentId when actually viewed.
+async function listDeliveryNotesFast(client) {
+  const { rows } = await client.query(`
+    SELECT
+      dn.*,
+      COALESCE(lines_agg.lines, '[]'::json) AS lines_json,
+      COALESCE(att_agg.attachments, '[]'::json) AS attachments_json
+    FROM delivery_notes dn
+    LEFT JOIN LATERAL (
+      SELECT json_agg(
+        json_build_object(
+          'slNo', dnl.sl_no, 'plantName', dnl.plant_name, 'plantCode', dnl.plant_code,
+          'spec', dnl.spec, 'qty', dnl.qty, 'deliveryQty', dnl.delivery_qty,
+          'postedQty', dnl.posted_qty, 'remainingQty', dnl.remaining_qty,
+          'remarks', dnl.remarks, 'location', dnl.location,
+          'hasSplit', dnl.has_split, 'isPending', dnl.is_pending, 'doRef', dnl.do_ref,
+          'serials', COALESCE(s.serials, '[]'::json)
+        ) ORDER BY dnl.sl_no
+      ) AS lines
+      FROM delivery_note_lines dnl
+      LEFT JOIN LATERAL (
+        SELECT json_agg(sr.code ORDER BY sr.id) AS serials
+        FROM serials sr
+        WHERE sr.dn_line_id = dnl.id
+      ) s ON true
+      WHERE dnl.dn_id = dn.id
+    ) lines_agg ON true
+    LEFT JOIN LATERAL (
+      SELECT json_agg(
+        json_build_object(
+          'id', a.id, 'name', a.name, 'type', a.mime_type, 'size', a.size_bytes,
+          'uploadedBy', a.uploaded_by, 'uploadedAt', a.uploaded_at
+        ) ORDER BY a.id
+      ) AS attachments
+      FROM delivery_note_attachments a
+      WHERE a.dn_id = dn.id
+    ) att_agg ON true
+    ORDER BY dn.id DESC
+  `);
+  return rows.map(dn => ({
+    no: dn.no,
+    gpNo: dn.gp_no || '',
+    customerProject: dn.customer_project || '',
+    customerCode: dn.customer_code || '',
+    location: dn.location || '',
+    date: dn.dn_date || '',
+    vhNumber: dn.vh_number || '',
+    project: dn.project || '',
+    preparedBy: dn.prepared_by || '',
+    modifiedBy: dn.modified_by || null,
+    modifiedAt: dn.modified_at ? formatDate(dn.modified_at) : null,
+    status: dn.status,
+    createdAt: formatDate(dn.created_at) || '',
+    lines: (dn.lines_json || []).map(l => ({
+      slNo: l.slNo,
+      plantName: l.plantName || '',
+      plantCode: l.plantCode || '',
+      spec: l.spec || '',
+      qty: Number(l.qty) || 0,
+      deliveryQty: Number(l.deliveryQty) || 0,
+      postedQty: l.postedQty != null ? String(l.postedQty) : '0',
+      remainingQty: l.remainingQty != null ? String(l.remainingQty) : '0',
+      remarks: l.remarks || '',
+      location: l.location || '',
+      hasSplit: !!l.hasSplit,
+      isPending: !!l.isPending,
+      doRef: l.doRef || '',
+      serials: l.serials || [],
+    })),
+    attachments: (dn.attachments_json || []).map(a => ({
+      id: String(a.id),
+      name: a.name || '',
+      type: a.type || '',
+      size: Number(a.size) || 0,
+      uploadedBy: a.uploadedBy || '',
+      uploadedAt: formatDate(a.uploadedAt) || '',
+    })),
+  }));
+}
+
 async function nextDnNo(client) {
   const { rows } = await client.query(
     `SELECT value FROM app_settings WHERE key = 'number_settings' FOR UPDATE`
@@ -130,10 +219,7 @@ async function touchDn(client, dnId, modifiedBy) {
 // GET /api/delivery-notes
 router.get('/', async (req, res, next) => {
   try {
-    const ids = (await pool.query('SELECT id FROM delivery_notes ORDER BY id DESC')).rows.map(r => r.id);
-    const out = [];
-    for (const id of ids) out.push(await loadDeliveryNote(pool, id));
-    res.json(out);
+    res.json(await listDeliveryNotesFast(pool));
   } catch (err) { next(err); }
 });
 
@@ -143,6 +229,31 @@ router.get('/:no', async (req, res, next) => {
     const row = (await pool.query('SELECT id FROM delivery_notes WHERE no = $1', [req.params.no])).rows[0];
     if (!row) return res.status(404).json({ error: 'Delivery note not found' });
     res.json(await loadDeliveryNote(pool, row.id));
+  } catch (err) { next(err); }
+});
+
+// GET /api/delivery-notes/:no/attachments/:attachmentId
+// Full attachment content (including the base64 dataUrl), fetched lazily —
+// only when a user actually opens/previews it, not on every list load/poll.
+router.get('/:no/attachments/:attachmentId', async (req, res, next) => {
+  try {
+    const dn = (await pool.query('SELECT id FROM delivery_notes WHERE no = $1', [req.params.no])).rows[0];
+    if (!dn) return res.status(404).json({ error: 'Delivery note not found' });
+    const { rows } = await pool.query(
+      'SELECT * FROM delivery_note_attachments WHERE dn_id = $1 AND id = $2',
+      [dn.id, Number(req.params.attachmentId)]
+    );
+    const a = rows[0];
+    if (!a) return res.status(404).json({ error: 'Attachment not found' });
+    res.json({
+      id: String(a.id),
+      name: a.name || '',
+      type: a.mime_type || '',
+      size: Number(a.size_bytes) || 0,
+      dataUrl: a.data_url || '',
+      uploadedBy: a.uploaded_by || '',
+      uploadedAt: formatDate(a.uploaded_at) || '',
+    });
   } catch (err) { next(err); }
 });
 
@@ -540,4 +651,4 @@ router.delete('/:no/attachments/:attachmentId', requireRole('admin', 'garden'), 
 });
 
 export default router;
-export { loadDeliveryNote };
+export { loadDeliveryNote, listDeliveryNotesFast };

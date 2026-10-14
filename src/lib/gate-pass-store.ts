@@ -60,7 +60,11 @@ export interface DNAttachment {
   name: string;
   type: string;
   size: number;
-  dataUrl: string;
+  // Present when loaded from LocalStore, from a single-record API response
+  // (after upload/create/update), or via getDeliveryNoteAttachment(). Absent
+  // on attachments coming back from the list/poll path (ApiStore.loadAll) —
+  // call getDeliveryNoteAttachment() to fetch the real file on demand there.
+  dataUrl?: string;
   uploadedBy: string;
   uploadedAt: string;
 }
@@ -255,6 +259,10 @@ export interface DataStore {
   completeDeliveryNote(dnNo: string): Promise<DeliveryNote>;
   addDeliveryNoteAttachment(dnNo: string, file: { name: string; type: string; size: number; dataUrl: string }): Promise<DeliveryNote>;
   removeDeliveryNoteAttachment(dnNo: string, attachmentId: string): Promise<DeliveryNote>;
+  // The list/poll path omits attachment dataUrl (it's the full base64 file —
+  // too heavy to re-send on every 45s refresh). Call this to fetch the real
+  // file content only when a user actually opens/downloads one.
+  getDeliveryNoteAttachment(dnNo: string, attachmentId: string): Promise<DNAttachment>;
   createCustomer(form: { customerName: string; party: 'EXT' | 'INT'; projects: string[] }): Promise<Customer>;
   updateCustomer(id: string, form: { customerName: string; party: 'EXT' | 'INT'; projects: string[] }): Promise<Customer>;
   createPlantMaster(form: { category: string; plantName: string }): Promise<PlantMaster>;
@@ -734,6 +742,17 @@ export class LocalStore implements DataStore {
     return dn;
   }
 
+  // Local mode always keeps the full attachment (including dataUrl) in
+  // localStorage already — nothing extra to fetch.
+  async getDeliveryNoteAttachment(dnNo: string, attachmentId: string): Promise<DNAttachment> {
+    const data = this.read();
+    const dn = data.dns.find(d => d.no === dnNo);
+    if (!dn) throw new Error('Delivery note not found');
+    const attachment = dn.attachments.find(a => a.id === attachmentId);
+    if (!attachment) throw new Error('Attachment not found');
+    return attachment;
+  }
+
   async createCustomer(form: { customerName: string; party: 'EXT' | 'INT'; projects: string[] }): Promise<Customer> {
     const data = this.read();
     const c: Customer = {
@@ -1163,6 +1182,12 @@ export class ApiStore implements DataStore {
     return this.request(
       `/api/delivery-notes/${encodeURIComponent(dnNo)}/attachments/${encodeURIComponent(attachmentId)}`,
       { method: 'DELETE' },
+    );
+  }
+
+  async getDeliveryNoteAttachment(dnNo: string, attachmentId: string): Promise<DNAttachment> {
+    return this.request(
+      `/api/delivery-notes/${encodeURIComponent(dnNo)}/attachments/${encodeURIComponent(attachmentId)}`,
     );
   }
 

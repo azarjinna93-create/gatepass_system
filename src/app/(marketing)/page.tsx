@@ -581,7 +581,8 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-function downloadDataUrl(dataUrl: string, filename: string) {
+function downloadDataUrl(dataUrl: string | undefined, filename: string) {
+  if (!dataUrl) return;
   const a = document.createElement('a');
   a.href = dataUrl; a.download = filename; a.click();
 }
@@ -1134,9 +1135,16 @@ export default function GatePassApp() {
   // Keep data in sync with other users on the shared database — poll in the
   // background, plus an immediate refresh whenever the tab regains focus so
   // switching back to it doesn't leave stale data waiting on the next tick.
+  // Skip the tick entirely while the tab is hidden/minimized — every open
+  // admin tab was otherwise polling the full dataset every 15s regardless of
+  // whether anyone was looking at it, which is most of the time on a desk
+  // that's left logged in all day. 45s is a loose-enough bound since focus
+  // already forces an immediate refresh the moment someone comes back.
   useEffect(() => {
     if (!auth) return;
-    const interval = setInterval(() => { void reload(); }, 15000);
+    const interval = setInterval(() => {
+      if (document.visibilityState === 'visible') void reload();
+    }, 45000);
     const onFocus = () => { void reload(); };
     const onVisibility = () => { if (document.visibilityState === 'visible') onFocus(); };
     window.addEventListener('focus', onFocus);
@@ -4030,6 +4038,27 @@ function ViewDeliveryNote({ dn, gp, role, scanned, target, onBack, onContinueSca
   const [uploadingAttachment, setUploadingAttachment] = useState(false);
   const [attachError, setAttachError] = useState<string | null>(null);
   const [previewAttachment, setPreviewAttachment] = useState<DNAttachment | null>(null);
+  const [openingAttachmentId, setOpeningAttachmentId] = useState<string | null>(null);
+  // The list/poll path no longer carries attachment dataUrl (moved out of the
+  // hot payload — see gate-pass-store.ts). Fetch the real file only now, when
+  // someone actually opens it; an attachment added earlier in this session
+  // (e.g. right after upload) still has it inline, so skip the round trip then.
+  const openAttachment = async (a: DNAttachment) => {
+    let full = a;
+    if (!full.dataUrl) {
+      setOpeningAttachmentId(a.id);
+      try {
+        full = await getStore().getDeliveryNoteAttachment(dn.no, a.id);
+      } catch (e) {
+        setAttachError((e as Error).message);
+        return;
+      } finally {
+        setOpeningAttachmentId(null);
+      }
+    }
+    if (full.type.startsWith('image/')) setPreviewAttachment(full);
+    else downloadDataUrl(full.dataUrl, full.name);
+  };
   const handleAttachFiles = async (files: FileList | null) => {
     if (!files || !files.length) return;
     setAttachError(null);
@@ -4391,11 +4420,12 @@ function ViewDeliveryNote({ dn, gp, role, scanned, target, onBack, onContinueSca
           {dn.attachments.map(a => (
             <div key={a.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 0', borderBottom: '1px solid #f1f4f1' }}>
               <button
-                onClick={() => a.type.startsWith('image/') ? setPreviewAttachment(a) : downloadDataUrl(a.dataUrl, a.name)}
-                style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', textAlign: 'left', background: 'none', border: 'none', cursor: 'pointer', fontFamily: 'inherit', padding: 0 }}
+                onClick={() => openAttachment(a)}
+                disabled={openingAttachmentId === a.id}
+                style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', textAlign: 'left', background: 'none', border: 'none', cursor: openingAttachmentId === a.id ? 'default' : 'pointer', fontFamily: 'inherit', padding: 0, opacity: openingAttachmentId === a.id ? 0.6 : 1 }}
               >
                 <span style={{ fontSize: 13.5, fontWeight: 600, color: C.primary }}>{a.name}</span>
-                <span style={{ fontSize: 11.5, color: '#9aa39d' }}>{formatBytes(a.size)} · {a.uploadedBy} · {a.uploadedAt}</span>
+                <span style={{ fontSize: 11.5, color: '#9aa39d' }}>{formatBytes(a.size)} · {a.uploadedBy} · {a.uploadedAt}{openingAttachmentId === a.id ? ' · Opening…' : ''}</span>
               </button>
               <button onClick={() => onRemoveAttachment(dn.no, a.id)} style={{ background: 'none', border: 'none', color: '#c46', fontSize: 17, cursor: 'pointer', lineHeight: 1, fontFamily: 'inherit', padding: '0 4px' }}>×</button>
             </div>
