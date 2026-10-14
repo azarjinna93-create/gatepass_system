@@ -1738,20 +1738,26 @@ export default function GatePassApp() {
 
   // ── Scan handlers ──
   const doScan = async (code: string) => {
-    if (!code.trim() || !scanDnNo) return;
+    const trimmed = code.trim();
+    if (!trimmed || !scanDnNo) return;
+    if (trimmed.length < 10) {
+      setScanFeedback({ msg: `Barcode too short — min 10 characters (got ${trimmed.length})`, ok: false });
+      setTimeout(() => setScanFeedback(null), 3500);
+      // Keep the partial entry in the field so the operator can keep typing
+      // up to the minimum length instead of retyping from scratch.
+      setTimeout(() => scanRef.current?.focus(), 50);
+      return;
+    }
     try {
-      await getStore().addSerial(scanDnNo, scanLineSlNo, code.trim());
-      await reload();
-      setScanFeedback({ msg: `✓  ${code.trim()} scanned`, ok: true });
+      const updated = await getStore().addSerial(scanDnNo, scanLineSlNo, trimmed);
+      setDns(prev => prev.map(d => d.no === updated.no ? updated : d));
+      setScanFeedback({ msg: `✓  ${trimmed} scanned`, ok: true });
       setTimeout(() => setScanFeedback(null), 2500);
       // auto-advance to next incomplete line
-      const fresh = (await getStore().loadAll()).dns.find(d => d.no === scanDnNo);
-      if (fresh) {
-        const cur = fresh.lines.find(l => l.slNo === scanLineSlNo);
-        if (cur && cur.serials.length >= cur.deliveryQty) {
-          const next = fresh.lines.find(l => l.serials.length < l.deliveryQty);
-          if (next) setScanLineSlNo(next.slNo);
-        }
+      const cur = updated.lines.find(l => l.slNo === scanLineSlNo);
+      if (cur && cur.serials.length >= cur.deliveryQty) {
+        const next = updated.lines.find(l => l.serials.length < l.deliveryQty);
+        if (next) setScanLineSlNo(next.slNo);
       }
     } catch (e) {
       setScanFeedback({ msg: (e as Error).message, ok: false });
@@ -1763,8 +1769,8 @@ export default function GatePassApp() {
 
   const removeSerial = async (dnNo: string, slNo: number, code: string) => {
     try {
-      await getStore().removeSerial(dnNo, slNo, code);
-      await reload();
+      const updated = await getStore().removeSerial(dnNo, slNo, code);
+      setDns(prev => prev.map(d => d.no === updated.no ? updated : d));
     } catch (e) { setToast((e as Error).message); }
   };
 
@@ -1785,6 +1791,9 @@ export default function GatePassApp() {
   };
 
   const simulateScan = () => {
+    // If the operator has typed a barcode manually (e.g. the hardware scanner
+    // failed to read it), submit that instead of a fake generated code.
+    if (scanInput.trim()) { doScan(scanInput); return; }
     const code = `AC-${Math.floor(800000 + Math.random() * 200000)}`;
     doScan(code);
   };
@@ -2428,9 +2437,6 @@ export default function GatePassApp() {
               }}
               onRemoveSerial={async (slNo, code) => {
                 await removeSerial(activeDn.no, slNo, code);
-                await reload();
-                const fresh = (await getStore().loadAll()).dns.find(d => d.no === activeDn.no);
-                if (fresh) setActiveDnNo(fresh.no);
               }}
               onPrint={() => window.print()}
               onSaveHeader={async (dnNo, form) => {
@@ -3665,7 +3671,7 @@ export default function GatePassApp() {
               onScanKey={e => { if (e.key === 'Enter') doScan(scanInput); }}
               onSimulate={simulateScan}
               onSelectLine={setScanLineSlNo}
-              onRemoveSerial={async (slNo, code) => { await removeSerial(scanDn.no, slNo, code); await reload(); }}
+              onRemoveSerial={async (slNo, code) => { await removeSerial(scanDn.no, slNo, code); }}
               onComplete={completeDn}
               onBack={() => setView(auth?.role === 'admin' ? 'admin_dns' : 'garden_scanning')}
               onNotifyAdmin={notifyAdmin}
@@ -4567,7 +4573,7 @@ function ScanScreen({
               <button
                 onClick={onSimulate}
                 style={{ marginTop: 12, background: '#e9d9a6', color: '#123c2b', border: 'none', borderRadius: 8, padding: '9px 16px', fontSize: 13, fontWeight: 700, cursor: 'pointer', fontFamily: 'inherit' }}>
-                ⌁ Simulate scan
+                {scanInput.trim() ? '⏎ Submit entry' : '⌁ Simulate scan'}
               </button>
             </div>
 
